@@ -38,12 +38,11 @@ use File::Basename;
 use File::Spec qw/ tmpdir /;
 use File::Temp qw/ tempfile /;
 use Benchmark;
-use List::Util qw/ min /;
 
 #set locale to LC_NUMERIC C
 setlocale(LC_NUMERIC,"C");
 
-$VERSION = '18.2';
+$VERSION = '19.0';
 $PSQL = $ENV{PLSQL} || 'psql';
 
 $| = 1;
@@ -2562,7 +2561,11 @@ sub read_schema_from_file
 				$self->{tables}{$tb_name}{table_info}{tablespace} =~ s/"//gs;
 			}
 			if ($tb_param =~ /PCTFREE\s+(\d+)/is) {
-				$self->{tables}{$tb_name}{table_info}{fillfactor} = 100 - min(90, $1);
+				# We only take care of pctfree upper than the default
+				if ($1 > 10) {
+					# fillfactor must be >= 10
+					$self->{tables}{$tb_name}{table_info}{fillfactor} = 100 - min(90, $1);
+				}
 			}
 			if ($tb_param =~ /\bNOLOGGING\b/is) {
 				$self->{tables}{$tb_name}{table_info}{nologging} = 1;
@@ -3747,7 +3750,7 @@ sub _get_sql_data
 					$sql_output .= " IS E'" . $self->{views}{$view}{comment} . "';\n\n";
 				}
 
-				foreach $f (keys %{$self->{views}{$view}{column_comments}}) {
+				foreach $f (sort keys %{$self->{views}{$view}{column_comments}}) {
 					next unless $self->{views}{$view}{column_comments}{$f};
 					$self->{views}{$view}{column_comments}{$f} =~ s/'/''/gs;
 					# Change column names
@@ -4293,6 +4296,7 @@ LANGUAGE plpgsql ;
 			chomp($trig->[4]);
 
 			$trig->[4] =~ s/([^\*])[;\/]$/$1/;
+
 			$self->logit("\tDumping trigger $trig->[0] defined on table $trig->[3]...\n", 1);
 			my $tbname = $self->get_replaced_tbname($trig->[3]);
 
@@ -4306,8 +4310,20 @@ LANGUAGE plpgsql ;
 					my $cname = $self->{replaced_cols}{"\L$trig->[3]\E"}{"\L$coln\E"};
 					$cname = $self->quote_object_name($cname);
 					$trig->[4] =~ s/(OLD|NEW)\.$coln\b/$1\.$cname/igs;
+					$trig->[6] =~ s/\b$coln\b/$self->{replaced_cols}{"\L$trig->[3]\E"}{"\L$coln\E"}/is;
 				}
 			}
+			# Extract columns specified in the UPDATE OF ... ON clause
+			my $cols = '';
+			if ($trig->[2] eq 'UPDATE' && $trig->[6] =~ /UPDATE\s+OF\s+(.*?)\s+ON/i) {
+				my @defs = split(/\s*,\s*/, $1);
+				$cols = ' OF ';
+				foreach my $c (@defs) {
+					$cols .= $self->quote_object_name($c) . ',';
+				}
+				$cols =~ s/,$//;
+			}
+
 			if ($self->{export_schema} && !$self->{schema}) {
 				$sql_output .= $self->set_search_path($trig->[8]) . "\n";
 			}
@@ -4430,7 +4446,7 @@ LANGUAGE plpgsql ;
 					$sql_output .= "CREATE TRIGGER " . $self->quote_object_name($trig->[0]) . "\n\t";
 					my $statement = 0;
 					$statement = 1 if ($trig->[1] =~ s/ STATEMENT//);
-					$sql_output .= "$trig->[1] $trig->[2] ON " . $self->quote_object_name($tbname) . " ";
+					$sql_output .= "$trig->[1] $trig->[2]$cols ON " . $self->quote_object_name($tbname) . " ";
 					if ($statement) {
 						$sql_output .= "FOR EACH STATEMENT\n";
 					} else {
@@ -4711,6 +4727,7 @@ LANGUAGE plpgsql ;
 			# Get all metadata from all functions when we are
 			# reading a file, otherwise it has already been done
 			foreach my $fct (sort keys %{$self->{functions}}) {
+				$self->{functions}{$fct}{text} =~ s/(.*?\b(?:FUNCTION|PROCEDURE)\s+(?:[^\s\(]+))(\s*\%ORA2PG_COMMENT\d+\%\s*)+/$2$1 /is;
 				my %fct_detail = $self->_lookup_function($self->{functions}{$fct}{text}, ($self->{is_mysql}) ? $fct : undef);
 				if (!exists $fct_detail{name}) {
 					delete $self->{functions}{$fct};
@@ -4885,6 +4902,7 @@ LANGUAGE plpgsql ;
 			# Get all metadata from all procedures when we are
 			# reading a file, otherwise it has already been done
 			foreach my $fct (sort keys %{$self->{procedures}}) {
+				$self->{procedures}{$fct}{text} =~ s/(.*?\b(?:FUNCTION|PROCEDURE)\s+(?:[^\s\(]+))(\s*\%ORA2PG_COMMENT\d+\%\s*)+/$2$1 /is;
 				my %fct_detail = $self->_lookup_function($self->{procedures}{$fct}{text}, ($self->{is_mysql}) ? $fct : undef);
 				if (!exists $fct_detail{name}) {
 					delete $self->{procedures}{$fct};
@@ -5016,27 +5034,46 @@ LANGUAGE plpgsql ;
 			my $old_line = '';
 			my $skip_pkg_header = 0;
 			$self->_remove_comments(\$content);
-			$content =~ s/(?:CREATE|CREATE OR REPLACE)?\s*(?:EDITABLE|NONEDITABLE)?\s*PACKAGE\s+/CREATE OR REPLACE PACKAGE /igs;
-			my @pkg_content = split(/CREATE OR REPLACE PACKAGE BODY\s+/i, $content);
+			# Normalise start of package declaration
+			$content =~ s/CREATE(?:\s+OR\s+REPLACE)?(?:\s+EDITABLE|\s+NONEDITABLE)?\s+PACKAGE\s+/CREATE OR REPLACE PACKAGE /igs;
+			# Preserve hearder
+			$content =~ s/^(.*?)(CREATE OR REPLACE PACKAGE)/$2/s;
+			my $start = $1 || '';
+			my @pkg_content = split(/CREATE OR REPLACE PACKAGE\s+/is, $content);
 			for (my $i = 0; $i <= $#pkg_content; $i++) {
-				if ($pkg_content[$i] !~ /^(?:\s*\%ORA2PG_COMMENT\d+\%\s*)?CREATE/is) {
-					if ($pkg_content[$i] =~ /^([^\s]+)/) {
+				# package declaration
+				if ($pkg_content[$i] !~ /^BODY\s+/is) {
+					if ($pkg_content[$i] =~ /^([^\s]+)/is) {
 						my $pname = lc($1);
 						$pname =~ s/"//g;
-						if ($i > 0 && $pkg_content[$i-1] =~ /CREATE OR REPLACE PACKAGE/is) {
-							$self->{packages}{$pname}{text} = $pkg_content[$i-1];
-						}
-						$self->{packages}{$pname}{text} .= 'CREATE OR REPLACE PACKAGE BODY ' . $pkg_content[$i];
+						$pname =~ s/^[^\.]+\.//g;
+						$self->{packages}{$pname}{desc} = 'CREATE OR REPLACE PACKAGE ' . $pkg_content[$i];
+						$self->{packages}{$pname}{text} =  $start if ($start);
+						$start = '';
+					}
+				} else {
+					if ($pkg_content[$i] =~ /^BODY\s+([^\s]+)\s+/is) {
+						my $pname = lc($1);
+						$pname =~ s/"//g;
+						$pname =~ s/^[^\.]+\.//g;
+						$self->{packages}{$pname}{text} .= 'CREATE OR REPLACE PACKAGE ' . $pkg_content[$i];
 					}
 				}
 			}
 			@pkg_content = ();
 
 			foreach my $pkg (sort keys %{$self->{packages}}) {
+				my $tmp_txt = '';
+				if (exists $self->{packages}{$pkg}{desc}) {
+					# Move comments at end of package declaration before package definition
+					while ($self->{packages}{$pkg}{desc} =~ s/(\%ORA2PG_COMMENT\d+\%\s*)$//) {
+						$self->{packages}{$pkg}{text} = $1 . $self->{packages}{$pkg}{text};
+					}
+				}
 				# Get all metadata from all procedures/function when we are
 				# reading from a file, otherwise it has already been done
-				my $tmp_txt = "$self->{packages}{$pkg}{text}";
-				$tmp_txt =~ s/^(.*)CREATE OR REPLACE PACKAGE BODY/CREATE OR REPLACE PACKAGE BODY/s;
+				$tmp_txt = $self->{packages}{$pkg}{text};
+				$tmp_txt =~ s/^.*CREATE OR REPLACE PACKAGE\s+/CREATE OR REPLACE PACKAGE /s;
 				my %infos = $self->_lookup_package($tmp_txt);
 				my $sch = 'unknown';
 				my $pname = $pkg;
@@ -5055,6 +5092,7 @@ LANGUAGE plpgsql ;
 				$self->_restore_comments(\$self->{packages}{$pkg}{text});
 			}
 		}
+
 		#--------------------------------------------------------
 		my $default_global_vars = '';
 
@@ -5075,11 +5113,12 @@ LANGUAGE plpgsql ;
 				foreach my $n (sort keys %{$self->{global_variables}}) {
 					if (exists $self->{global_variables}{$n}{constant} || exists $self->{global_variables}{$n}{default}) {
 						$default_global_vars .= "$n = '$self->{global_variables}{$n}{default}'\n";
+					} else {
+						$default_global_vars .= "$n = ''\n";
 					}
 				}
 			}
 			%{$self->{global_variables}} = ();
-
 			my $pkgbody = '';
 			my $fct_cost = '';
 			if (!$self->{plsql_pgsql}) {
@@ -5100,47 +5139,43 @@ LANGUAGE plpgsql ;
 					$total_size += length($self->{packages}->{$pkg}{text});
 				}
 				$self->_remove_comments(\$self->{packages}{$pkg}{text});
-				my @codes = split(/CREATE(?: OR REPLACE)?(?: EDITABLE| NONEDITABLE)? PACKAGE\s+/i, $self->{packages}{$pkg}{text});
+
+				# Normalyse package creation call
+				$self->{packages}{$pkg}{text} =~ s/CREATE(?:\s+OR\s+REPLACE)?(?:\s+EDITABLE|\s+NONEDITABLE)?\s+PACKAGE\s+/CREATE OR REPLACE PACKAGE /is;
 				if ($self->{estimate_cost}) {
-					foreach my $txt (@codes) {
-						next if ($txt !~ /^BODY\s+/is);
-						my %infos = $self->_lookup_package("CREATE OR REPLACE PACKAGE $txt");
-						foreach my $f (sort keys %infos) {
-							next if (!$f);
-							my @cnt = $infos{$f}{code} =~ /(\%ORA2PG_COMMENT\d+\%)/i;
-							$total_size_no_comment += (length($infos{$f}{code}) - (17 * length(join('', @cnt))));
-							my ($cost, %cost_detail) = Ora2Pg::PLSQL::estimate_cost($self, $infos{$f}{code});
-							$self->logit("Function $f estimated cost: $cost\n", 1);
-							$cost_value += $cost;
-							$number_fct++;
-							$fct_cost .= "\t-- Function $f total estimated cost: $cost\n";
-							foreach (sort { $cost_detail{$b} <=> $cost_detail{$a} } keys %cost_detail) {
-								next if (!$cost_detail{$_});
-								$fct_cost .= "\t\t-- $_ => $cost_detail{$_}";
-								if (!$self->{is_mysql}) {
-									$fct_cost .= " (cost: $Ora2Pg::PLSQL::UNCOVERED_SCORE{$_})" if ($Ora2Pg::PLSQL::UNCOVERED_SCORE{$_});
-								} else {
-									$fct_cost .= " (cost: $Ora2Pg::PLSQL::UNCOVERED_MYSQL_SCORE{$_})" if ($Ora2Pg::PLSQL::UNCOVERED_MYSQL_SCORE{$_});
-								}
-								$fct_cost .= "\n";
+					my %infos = $self->_lookup_package($self->{packages}{$pkg}{text});
+					foreach my $f (sort keys %infos) {
+						next if (!$f);
+						my @cnt = $infos{$f}{code} =~ /(\%ORA2PG_COMMENT\d+\%)/i;
+						$total_size_no_comment += (length($infos{$f}{code}) - (17 * length(join('', @cnt))));
+						my ($cost, %cost_detail) = Ora2Pg::PLSQL::estimate_cost($self, $infos{$f}{code});
+						$self->logit("Function $f estimated cost: $cost\n", 1);
+						$cost_value += $cost;
+						$number_fct++;
+						$fct_cost .= "\t-- Function $f total estimated cost: $cost\n";
+						foreach (sort { $cost_detail{$b} <=> $cost_detail{$a} } keys %cost_detail) {
+							next if (!$cost_detail{$_});
+							$fct_cost .= "\t\t-- $_ => $cost_detail{$_}";
+							if (!$self->{is_mysql}) {
+								$fct_cost .= " (cost: $Ora2Pg::PLSQL::UNCOVERED_SCORE{$_})" if ($Ora2Pg::PLSQL::UNCOVERED_SCORE{$_});
+							} else {
+								$fct_cost .= " (cost: $Ora2Pg::PLSQL::UNCOVERED_MYSQL_SCORE{$_})" if ($Ora2Pg::PLSQL::UNCOVERED_MYSQL_SCORE{$_});
 							}
+							$fct_cost .= "\n";
 						}
-						$cost_value += $Ora2Pg::PLSQL::OBJECT_SCORE{'PACKAGE BODY'};
 					}
+					$cost_value += $Ora2Pg::PLSQL::OBJECT_SCORE{'PACKAGE BODY'};
 					$fct_cost .= "-- Total estimated cost for package $pkg: $cost_value units, " . $self->_get_human_cost($cost_value) . "\n";
 				}
-				foreach my $txt (@codes) {
-					next if (!$txt);
-					$txt = $self->_convert_package("CREATE OR REPLACE PACKAGE $txt", $self->{packages}{$pkg}{owner});
-					$self->_restore_comments(\$txt) if (!$self->{file_per_function});
-					$txt =~ s/(-- REVOKE ALL ON FUNCTION [^;]+ FROM PUBLIC;)/&remove_newline($1)/sge;
-					if (!$self->{file_per_function}) {
-						$self->normalize_function_call(\$txt);
-					}
-					$pkgbody .= $txt;
-					$pkgbody =~ s/[\r\n]*\bEND;\s*$//is;
-					$pkgbody =~ s/(\s*;)\s*$/$1/is;
+				$txt = $self->_convert_package($pkg);
+				$self->_restore_comments(\$txt) if (!$self->{file_per_function});
+				$txt =~ s/(-- REVOKE ALL ON FUNCTION [^;]+ FROM PUBLIC;)/&remove_newline($1)/sge;
+				if (!$self->{file_per_function}) {
+					$self->normalize_function_call(\$txt);
 				}
+				$pkgbody .= $txt;
+				$pkgbody =~ s/[\r\n]*\bEND;\s*$//is;
+				$pkgbody =~ s/(\s*;)\s*$/$1/is;
 			}
 			if ($self->{estimate_cost}) {
 				$self->logit("Total size of package code: $total_size bytes.\n", 1);
@@ -5182,6 +5217,8 @@ LANGUAGE plpgsql ;
 			foreach my $n (sort keys %{$self->{global_variables}}) {
 				if (exists $self->{global_variables}{$n}{constant} || exists $self->{global_variables}{$n}{default}) {
 					$default_global_vars .= "$n = '$self->{global_variables}{$n}{default}'\n";
+				} else {
+					$default_global_vars .= "$n = ''\n";
 				}
 			}
 		}
@@ -5211,19 +5248,28 @@ LANGUAGE plpgsql ;
 			$self->{types} = ();
 			$self->logit("Reading input code from file $self->{input_file}...\n", 1);
 			my $content = $self->read_input_file($self->{input_file});
+			$self->_remove_comments(\$content);
+			my $i = 0;
 			foreach my $l (split(/;/, $content)) {
 				chomp($l);
 				next if ($l =~ /^[\s\/]*$/s);
-				$l =~ s/^.*CREATE\s+(?:OR REPLACE)?\s*(?:NONEDITABLE|EDITABLE)?\s*//is;
-				$l .= ";\n";
-				if ($l =~ /^TYPE\s+([^\s\(]+)/is) {
-					push(@{$self->{types}}, { ('name' => $1, 'code' => $l) });
+				my $cmt = '';
+				while ($l =~ s/(\%ORA2PG_COMMENT\d+\%)//s) {
+					$cmt .= "$1";
 				}
+				$self->_restore_comments(\$cmt);
+				$l =~ s/^\s+//;
+				$l =~ s/^CREATE\s+(?:OR REPLACE)?\s*(?:NONEDITABLE|EDITABLE)?\s*//is;
+				$l .= ";\n";
+				if ($l =~ /^(SUBTYPE|TYPE)\s+([^\s\(]+)/is) {
+					push(@{$self->{types}}, { ('name' => $2, 'code' => $l, 'comment' => $cmt, 'pos' => $i) });
+				}
+				$i++;
 			}
 		}
 		#--------------------------------------------------------
 		my $i = 1;
-		foreach my $tpe (sort {length($a->{name}) <=> length($b->{name}) } @{$self->{types}}) {
+		foreach my $tpe (sort {$a->{pos} <=> $b->{pos} } @{$self->{types}}) {
 			$self->logit("Dumping type $tpe->{name}...\n", 1);
 			if (!$self->{quiet} && !$self->{debug}) {
 				print STDERR $self->progress_bar($i, $#{$self->{types}}+1, 25, '=', 'types', "generating $tpe->{name}" ), "\r";
@@ -5231,11 +5277,16 @@ LANGUAGE plpgsql ;
 			if ($self->{plsql_pgsql}) {
 				$tpe->{code} = $self->_convert_type($tpe->{code}, $tpe->{owner});
 			} else {
-				$tpe->{code} = "CREATE$self->{create_or_replace} $tpe->{code}\n";
+				if ($tpe->{code} !~ /^SUBTYPE\s+/) {
+					$tpe->{code} = "CREATE$self->{create_or_replace} $tpe->{code}\n";
+				}
 			}
-			$sql_output .= $tpe->{code} . "\n";
+			$tpe->{code} =~ s/REPLACE type/REPLACE TYPE/;
+			$sql_output .= $tpe->{comment} . $tpe->{code} . "\n";
 			$i++;
 		}
+		$self->_restore_comments(\$sql_output);
+		$self->{comment_values} = ();
 
 		if (!$self->{quiet} && !$self->{debug}) {
 			print STDERR $self->progress_bar($i - 1, $#{$self->{types}}+1, 25, '=', 'types', 'end of output.'), "\n";
@@ -5966,7 +6017,7 @@ BEGIN
 						} else {
 							$check_cond .= " IN ($self->{partitions}{$table}{$pos}{info}[$i]->{value})";
 						}
-					} else {
+					} elsif ($self->{partitions}{$table}{$pos}{info}[$i]->{type} eq 'RANGE') {
 						if ($#{$self->{partitions}{$table}{$pos}{info}} == 0) {
 							if (!$self->{pg_supports_partition}) {
 								if ($old_part eq '') {
@@ -5999,6 +6050,16 @@ BEGIN
 								$check_cond .= " FROM (MINVALUE) TO (" .  $values[$i] . ")";
 							}
 						}
+					} elsif ($self->{partitions}{$table}{$pos}{info}[$i]->{type} eq 'HASH') {
+						if (!$self->{pg_supports_partition}) {
+							print STDERR "WARNING: Hash partitioning not supported, skipping partitioning of table $table\n";
+							next;
+						} else {
+							$check_cond .= " WITH (MODULUS " . (scalar keys %{$self->{partitions}{$table}}) . ", REMAINDER " . ($pos-1) . ")";
+						}
+					} else {
+						print STDERR "WARNING: Unknown partitioning type $self->{partitions}{$table}{$pos}{info}[$i]->{type}, skipping partitioning of table $table\n";
+						next;
 					}
 					if (!$self->{pg_supports_partition}) {
 						$check_cond .= " AND" if ($i < $#{$self->{partitions}{$table}{$pos}{info}});
@@ -6031,12 +6092,22 @@ BEGIN
 						} else {
 							push(@condition, "$fct(NEW.$colname) IN (" . Ora2Pg::PLSQL::convert_plsql_code($self, $self->{partitions}{$table}{$pos}{info}[$i]->{value}, %{$self->{data_type}}) . ")");
 						}
-					} else {
+					} elsif ($self->{partitions}{$table}{$pos}{info}[$i]->{type} eq 'RANGE') {
 						if (!$fct) {
 							push(@condition, "NEW.$self->{partitions}{$table}{$pos}{info}[$i]->{column} < " . Ora2Pg::PLSQL::convert_plsql_code($self, $self->{partitions}{$table}{$pos}{info}[$i]->{value}, %{$self->{data_type}}));
 						} else {
 							push(@condition, "$fct(NEW.$colname) < " . Ora2Pg::PLSQL::convert_plsql_code($self, $self->{partitions}{$table}{$pos}{info}[$i]->{value}, %{$self->{data_type}}));
 						}
+					} elsif ($self->{partitions}{$table}{$pos}{info}[$i]->{type} eq 'HASH') {
+						if (!$self->{pg_supports_partition}) {
+							print STDERR "WARNING: Hash partitioning not supported, skipping partitioning of table $table\n";
+							next;
+						} else {
+							# Nothing to do here with HASH partitioning
+						}
+					} else {
+						print STDERR "WARNING: Unknown partitioning type $self->{partitions}{$table}{$pos}{info}[$i]->{type}, skipping partitioning of table $table\n";
+						next;
 					}
 					$owner = $self->{partitions}{$table}{$pos}{info}[$i]->{owner} || '';
 				}
@@ -6081,7 +6152,7 @@ BEGIN
 								} else {
 									$sub_check_cond .= " IN ($self->{subpartitions}{$table}{$part}{$p}{info}[$i]->{value})";
 								}
-							} else {
+							} elsif ($self->{subpartitions}{$table}{$part}{$p}{info}[$i]->{type} eq 'RANGE') {
 								if ($#{$self->{subpartitions}{$table}{$part}{$p}{info}} == 0) {
 									if (!$self->{pg_supports_partition}) {
 										if ($sub_old_part eq '') {
@@ -6113,6 +6184,16 @@ BEGIN
 										$sub_check_cond .= " FROM (MINVALUE) TO (" .  $values[$i] . ")";
 									}
 								}
+							} elsif ($self->{subpartitions}{$table}{$part}{$p}{info}[$i]->{type} eq 'HASH') {
+								if (!$self->{pg_supports_partition}) {
+									print STDERR "WARNING: Hash partitioning not supported, skipping subpartitioning of table $table\n";
+									next;
+								} else {
+									$sub_check_cond .= " WITH (MODULUS " . (scalar keys %{$self->{subpartitions}{$table}}) . ", REMAINDER i" . ($p-1) . ")";
+								}
+							} else {
+								print STDERR "WARNING: Unknown partitioning type $self->{partitions}{$table}{$pos}{info}[$i]->{type}, skipping partitioning of table $table\n";
+								next;
 							}
 							if (!$self->{pg_supports_partition}) {
 								$sub_check_cond .= " AND " if ($i < $#{$self->{subpartitions}{$table}{$part}{$p}{info}});
@@ -6134,12 +6215,22 @@ BEGIN
 								} else {
 									push(@subcondition, "$fct(NEW.$colname) IN (" . Ora2Pg::PLSQL::convert_plsql_code($self, $self->{subpartitions}{$table}{$part}{$p}{info}[$i]->{value}, %{$self->{data_type}}) . ")");
 								}
-							} else {
+							} elsif ($self->{subpartitions}{$table}{$part}{$p}{info}[$i]->{type} eq 'RANGE') {
 								if (!$fct) {
 									push(@subcondition, "NEW.$self->{subpartitions}{$table}{$part}{$p}{info}[$i]->{column} < " . Ora2Pg::PLSQL::convert_plsql_code($self, $self->{subpartitions}{$table}{$part}{$p}{info}[$i]->{value}, %{$self->{data_type}}));
 								} else {
 									push(@subcondition, "$fct(NEW.$colname) < " . Ora2Pg::PLSQL::convert_plsql_code($self, $self->{subpartitions}{$table}{$part}{$p}{info}[$i]->{value}, %{$self->{data_type}}));
 								}
+							} elsif ($self->{subpartitions}{$table}{$part}{$p}{info}[$i]->{type} eq 'HASH') {
+								if (!$self->{pg_supports_partition}) {
+									print STDERR "WARNING: Hash partitioning not supported, skipping subpartitioning of table $table\n";
+									next;
+								} else {
+									# Nothing to do here with HASH partitioning
+								}
+							} else {
+								print STDERR "WARNING: Unknown partitioning type $self->{partitions}{$table}{$pos}{info}[$i]->{type}, skipping partitioning of table $table\n";
+								next;
 							}
 							$owner = $self->{subpartitions}{$table}{$part}{$p}{info}[$i]->{owner} || '';
 						}
@@ -6999,7 +7090,7 @@ sub read_input_file
 	my $content = '';
 	if (open(my $fin, '<', $file)) {
 		$self->set_binmode($fin) if (_is_utf8_file( $file));
-		while (<$fin>) { $content .= $_; };
+		while (<$fin>) { next if /^\/$/; $content .= $_; };
 		close($fin);
 	} else {
 		die "FATAL: can't read file $file, $!\n";
@@ -7185,11 +7276,15 @@ sub _column_comments
 		$sql .= " WHERE OWNER NOT IN ('" . join("','", @{$self->{sysusers}}) . "')";
 	}
 	$sql .= "AND TABLE_NAME='$table' " if ($table);
-	$sql .= $self->limit_to_objects('TABLE','TABLE_NAME') if (!$table);
+	if (!$table) {
+		$sql .= $self->limit_to_objects('TABLE','TABLE_NAME');
+	} else {
+		@{$self->{query_bind_params}} = ();
+	}
 
 	my $sth = $self->{dbh}->prepare($sql) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 	my %data = ();
 	while (my $row = $sth->fetch) {
 		if (!$self->{schema} && $self->{export_schema}) {
@@ -7238,7 +7333,7 @@ sub _create_indexes
 	my @out = ();
 	my @fts_out = ();
 	# Set the index definition
-	foreach my $idx (keys %indexes) {
+	foreach my $idx (sort keys %indexes) {
 
 		# Cluster, bitmap join, reversed and IOT indexes will not be exported at all
 		# Hash indexes will be exported as btree
@@ -7340,6 +7435,10 @@ sub _create_indexes
 			for ($i = 0; $i <= $#strings; $i++) {
 				$columns =~ s/\%\%string$i\%\%/'$strings[$i]'/;
 			}
+
+			# Replace call of schema.package.function() into package.function()
+			$columns =~ s/\b[^\s\.]+\.([^\s\.]+\.[^\s\.]+)\s*\(/$1\(/is;
+
 			my $schm = '';
 			my $idxname = '';
 			if ($idx =~ /^([^\.]+)\.(.*)$/) {
@@ -7943,7 +8042,7 @@ sub _extract_sequence_info
 	my @script = ();
 
 	my $sth = $self->{dbh}->prepare($sql) or $self->logit("FATAL: " . $self->{dbh}->errstr ."\n", 0, 1);
-	$sth->execute() or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	while (my $seq_info = $sth->fetchrow_hashref) {
 
@@ -8395,7 +8494,11 @@ sub _column_info
 	my $condition = '';
 	$condition .= "AND A.TABLE_NAME='$table' " if ($table);
 	$condition .= "AND A.OWNER='$owner' " if ($owner);
-	$condition .= $self->limit_to_objects('TABLE', 'A.TABLE_NAME') if (!$table);
+	if (!$table) {
+		$condition .= $self->limit_to_objects('TABLE', 'A.TABLE_NAME');
+	} else {
+		@{$self->{query_bind_params}} = ();
+	}
 
 	my $sth = '';
 	if ($self->{db_version} !~ /Release 8/) {
@@ -8439,7 +8542,7 @@ END
 			$self->logit("FATAL: _column_info() " . $self->{dbh}->errstr . "\n", 0, 1);
 		}
 	}
-	$sth->execute or $self->logit("FATAL: _column_info() " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: _column_info() " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	# Default number of line to scan to grab the geometry type of the column.
 	# If it not limited, the query will scan the entire table which may take a very long time.
@@ -8599,7 +8702,11 @@ sub _column_attributes
 	my $condition = '';
 	$condition .= "AND A.TABLE_NAME='$table' " if ($table);
 	$condition .= "AND A.OWNER='$owner' " if ($owner);
-	$condition .= $self->limit_to_objects('TABLE', 'A.TABLE_NAME') if (!$table);
+	if (!$table) {
+		$condition .= $self->limit_to_objects('TABLE', 'A.TABLE_NAME');
+	} else {
+		@{$self->{query_bind_params}} = ();
+	}
 
 	my $sth = '';
 	if ($self->{db_version} !~ /Release 8/) {
@@ -8622,7 +8729,7 @@ END
 			$self->logit("FATAL: _column_attributes() " . $self->{dbh}->errstr . "\n", 0, 1);
 		}
 	}
-	$sth->execute or $self->logit("FATAL: _column_attributes() " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: _column_attributes() " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my %data = ();
 	while (my $row = $sth->fetch) {
@@ -8679,7 +8786,11 @@ sub _encrypted_columns
 	my $condition = '';
 	$condition .= "AND A.TABLE_NAME='$table' " if ($table);
 	$condition .= "AND A.OWNER='$owner' " if ($owner);
-	$condition .= $self->limit_to_objects('TABLE', 'A.TABLE_NAME') if (!$table);
+	if (!$table) {
+		$condition .= $self->limit_to_objects('TABLE', 'A.TABLE_NAME');
+	} else {
+		@{$self->{query_bind_params}} = ();
+	}
 	$condition =~ s/^\s*AND /WHERE /s;
 
 	my $sth = $self->{dbh}->prepare(<<END);
@@ -8691,7 +8802,7 @@ END
 	if (!$sth) {
 		$self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 	}
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my %data = ();
 	while (my $row = $sth->fetch) {
@@ -8749,13 +8860,14 @@ sub _unique_key
 	$sql .= $self->limit_to_objects('TABLE', 'TABLE_NAME');
 	$sql .=  " ORDER BY POSITION";
 	my $sth = $self->{dbh}->prepare($sql) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $sth->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $sth->errstr . "\n", 0, 1);
 	my @cons_columns = ();
 	while (my $r = $sth->fetch) {
 		push(@cons_columns, [ @$r ]);
 	}
 	$sth->finish;
 
+	my @tmpparams = ();
 	my $condition = '';
 	$condition .= "AND TABLE_NAME='$table' " if ($table);
 	if ($owner) {
@@ -8764,7 +8876,9 @@ sub _unique_key
 		$condition .= "AND OWNER NOT IN ('" . join("','", @{$self->{sysusers}}) . "') ";
 	}
 	$condition .= $self->limit_to_objects('UKEY|TABLE', 'CONSTRAINT_NAME|TABLE_NAME');
+	push(@tmpparams, @{$self->{query_bind_params}});
 	$condition .= $self->limit_to_objects('UKEY', 'CONSTRAINT_NAME');
+	push(@tmpparams, @{$self->{query_bind_params}});
 
 	if ($self->{db_version} !~ /Release 8/) {
 		$sth = $self->{dbh}->prepare(<<END) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
@@ -8783,7 +8897,7 @@ AND STATUS='ENABLED'
 $condition
 END
 	}
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@tmpparams) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	while (my $row = $sth->fetch) {
 
@@ -8840,7 +8954,7 @@ WHERE CONSTRAINT_TYPE='C' $condition
 AND STATUS='ENABLED'
 END
 
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my %data = ();
 	while (my $row = $sth->fetch) {
@@ -8883,6 +8997,7 @@ sub _foreign_key
 
 	return Ora2Pg::MySQL::_foreign_key($self,$table,$owner) if ($self->{is_mysql});
 
+	my @tmpparams = ();
 	my $condition = '';
 	$condition .= "AND CONS.TABLE_NAME='$table' " if ($table);
 	if ($owner) {
@@ -8891,16 +9006,6 @@ sub _foreign_key
 		$condition .= "AND CONS.OWNER NOT IN ('" . join("','", @{$self->{sysusers}}) . "') ";
 	}
 	$condition .= $self->limit_to_objects('FKEY|TABLE','CONS.CONSTRAINT_NAME|CONS.TABLE_NAME');
-
-	my $condition2 = '';
-	$condition2 .= "AND TABLE_NAME='$table' " if ($table);
-	if ($owner) {
-		$condition2 .= "OWNER = '$owner' ";
-	} else {
-		$condition2 .= "AND OWNER NOT IN ('" . join("','", @{$self->{sysusers}}) . "') ";
-	}
-	$condition2 .= $self->limit_to_objects('TABLE','TABLE_NAME');
-	#$condition2 =~ s/^AND //;
 
 	my $deferrable = $self->{fkey_deferrable} ? "'DEFERRABLE' AS DEFERRABLE" : "DEFERRABLE";
 	my $defer = $self->{fkey_deferrable} ? "'DEFERRABLE' AS DEFERRABLE" : "CONS.DEFERRABLE";
@@ -8947,7 +9052,7 @@ ORDER BY CONS.TABLE_NAME, CONS.CONSTRAINT_NAME, COLS.POSITION
 END
 	}
 	my $sth = $self->{dbh}->prepare($sql) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $sth->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $sth->errstr . "\n", 0, 1);
 
 	my %data = ();
 	my %link = ();
@@ -9020,7 +9125,7 @@ sub _get_privilege
 	}
 	$str .= " ORDER BY b.TABLE_NAME, b.GRANTEE";
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 	while (my $row = $sth->fetch) {
 		next if ($row->[0] eq 'PUBLIC');
 		if (!$self->{schema} && $self->{export_schema}) {
@@ -9056,7 +9161,7 @@ sub _get_privilege
 	$str .= " " . $self->limit_to_objects('GRANT|TABLE|VIEW|FUNCTION|PROCEDURE|SEQUENCE', 'b.GRANTEE|b.TABLE_NAME|b.TABLE_NAME|b.TABLE_NAME|b.TABLE_NAME|b.TABLE_NAME');
 
 	$sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 	while (my $row = $sth->fetch) {
 		if (!$self->{schema} && $self->{export_schema}) {
 			$row->[2] = "$row->[1].$row->[2]";
@@ -9078,7 +9183,7 @@ sub _get_privilege
 		$str .= " " . $self->limit_to_objects('GRANT', 'GRANTEE');
 		$str .= " ORDER BY PRIVILEGE";
 		$sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-		$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+		$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 		while (my $row = $sth->fetch) {
 			push(@{$roles{admin}{$r}{privilege}}, $row->[0]);
 			push(@{$roles{admin}{$r}{admin_option}}, $row->[1]);
@@ -9091,7 +9196,7 @@ sub _get_privilege
 		$str .= " " . $self->limit_to_objects('GRANT', 'GRANTEE');
 		$str .= " ORDER BY GRANTED_ROLE";
 		$sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-		$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+		$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 		while (my $row = $sth->fetch) {
 			push(@{$roles{role}{$u}}, $row->[0]);
 		}
@@ -9099,7 +9204,7 @@ sub _get_privilege
 		$str .= " " . $self->limit_to_objects('GRANT', 'USERNAME');
 		$str .= " ORDER BY USERNAME";
 		$sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-		$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+		$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 		while (my $row = $sth->fetch) {
 			$roles{type}{$u} = 'USER';
 		}
@@ -9108,7 +9213,7 @@ sub _get_privilege
 		$str .= " " . $self->limit_to_objects('GRANT', 'ROLE');
 		$str .= " ORDER BY ROLE";
 		$sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-		$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+		$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 		while (my $row = $sth->fetch) {
 			$roles{type}{$u} = 'ROLE';
 			$roles{password_required}{$u} = $row->[1];
@@ -9156,7 +9261,7 @@ sub _get_security_definer
 	$str .= " ORDER BY OBJECT_NAME";
 
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 	while (my $row = $sth->fetch) {
 		next if (!$row->[0]);
 		if (!$self->{schema} && $self->{export_schema}) {
@@ -9200,7 +9305,11 @@ sub _get_indexes
 	my $condition = '';
 	$condition .= "AND A.TABLE_NAME='$table' " if ($table);
 	$condition .= "AND A.INDEX_OWNER='$owner' AND B.OWNER='$owner' " if ($owner);
-	$condition .= $self->limit_to_objects('TABLE|INDEX', "A.TABLE_NAME|A.INDEX_NAME") if (!$table);
+	if (!$table) {
+		$condition .= $self->limit_to_objects('TABLE|INDEX', "A.TABLE_NAME|A.INDEX_NAME");
+	} else {
+		@{$self->{query_bind_params}} = ();
+	}
 
 	# When comparing number of index we need to retrieve generated index (mostly PK)
         my $generated = '';
@@ -9227,7 +9336,7 @@ ORDER BY A.COLUMN_POSITION
 END
 	}
 
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my $idxnc = qq{SELECT IE.COLUMN_EXPRESSION FROM $self->{prefix}_IND_EXPRESSIONS IE, $self->{prefix}_IND_COLUMNS IC
 WHERE  IE.INDEX_OWNER = IC.INDEX_OWNER
@@ -9344,7 +9453,7 @@ WHERE (IXV_CLASS='WORDLIST' AND IXV_ATTRIBUTE='STEMMER') $condition
 ORDER BY IXV_INDEX_NAME
 END
 
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 	my %indexes_info = ();
 	while (my $row = $sth->fetch) {
 		my $save_idx = $row->[1];
@@ -9386,7 +9495,7 @@ sub _get_sequences
 
 
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my @seqs = ();
 	while (my $row = $sth->fetch) {
@@ -9424,7 +9533,7 @@ sub _get_identities
 	$str .= " ORDER BY OWNER, TABLE_NAME, COLUMN_NAME";
 
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my %seqs = ();
 	while (my $row = $sth->fetch) {
@@ -9478,7 +9587,7 @@ sub _get_external_tables
 	$str .= $self->limit_to_objects('TABLE', 'a.TABLE_NAME');
 	$str .= " ORDER BY a.TABLE_NAME";
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 	
 	my %data = ();
 	while (my $row = $sth->fetch) {
@@ -9528,7 +9637,7 @@ sub _get_directory
 	$str .= " ORDER BY d.DIRECTORY_NAME";
 
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 	
 	my %data = ();
 	while (my $row = $sth->fetch) {
@@ -9573,7 +9682,7 @@ sub _get_dblink
 	$str .= " ORDER BY DB_LINK";
 
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my %data = ();
 	while (my $row = $sth->fetch) {
@@ -9618,7 +9727,7 @@ sub _get_job
 	$str .= $self->limit_to_objects('JOB', 'JOB');
 	$str .= " ORDER BY JOB";
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my %data = ();
 	while (my $row = $sth->fetch) {
@@ -9679,7 +9788,7 @@ sub _get_views
 	my $sql = "SELECT A.TABLE_NAME,A.COMMENTS,A.TABLE_TYPE,A.OWNER FROM ALL_TAB_COMMENTS A, ALL_OBJECTS O WHERE A.OWNER=O.OWNER and A.TABLE_NAME=O.OBJECT_NAME and O.OBJECT_TYPE='VIEW' $owner";
 	$sql .= $self->limit_to_objects('VIEW', 'A.TABLE_NAME');
 	my $sth = $self->{dbh}->prepare( $sql ) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 	while (my $row = $sth->fetch) {
 		if (!$self->{schema} && $self->{export_schema}) {
 			$row->[0] = "$row->[0].$row->[3]";
@@ -9740,7 +9849,7 @@ ORDER BY ITER ASC, 2, 3
 	}
 
 	$sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my %data = ();
 	while (my $row = $sth->fetch) {
@@ -9787,7 +9896,7 @@ sub _get_materialized_views
 	if (not defined $sth) {
 		$self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 	}
-	if (not $sth->execute) {
+	if (not $sth->execute(@{$self->{query_bind_params}})) {
 		$self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 		return ();
 	}
@@ -9827,7 +9936,7 @@ sub _get_materialized_view_names
 	if (not defined $sth) {
 		$self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 	}
-	if (not $sth->execute) {
+	if (not $sth->execute(@{$self->{query_bind_params}})) {
 		$self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 	}
 
@@ -9908,7 +10017,7 @@ sub _get_triggers
 
 	$str .= " ORDER BY TABLE_NAME, TRIGGER_NAME";
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my @triggers = ();
 	while (my $row = $sth->fetch) {
@@ -9935,7 +10044,7 @@ sub _list_triggers
 
 	$str .= " ORDER BY TABLE_NAME, TRIGGER_NAME";
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my %triggers = ();
 	while (my $row = $sth->fetch) {
@@ -10180,7 +10289,7 @@ sub _get_functions
 	$str .= " " . $self->limit_to_objects('FUNCTION','OBJECT_NAME');
 	$str .= " ORDER BY OBJECT_NAME";
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my %functions = ();
 	my @fct_done = ();
@@ -10204,7 +10313,7 @@ sub _get_functions
 	$sql .= " " . $self->limit_to_objects('FUNCTION','NAME');
 	$sql .= " ORDER BY OWNER,NAME,LINE";
 	$sth = $self->{dbh}->prepare($sql) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $sth->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $sth->errstr . "\n", 0, 1);
 	while (my $row = $sth->fetch) {
 		if (!$self->{schema} && $self->{export_schema}) {
 			$row->[0] = "$row->[1].$row->[0]";
@@ -10236,7 +10345,7 @@ sub _get_functions2
 	$str .= " " . $self->limit_to_objects('FUNCTION','OBJECT_NAME');
 	$str .= " ORDER BY OBJECT_NAME";
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my %functions = ();
 	my @fct_done = ();
@@ -10284,7 +10393,7 @@ sub _get_procedures
 	$str .= " " . $self->limit_to_objects('PROCEDURE','OBJECT_NAME');
 	$str .= " ORDER BY OBJECT_NAME";
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my %procedures = ();
 	my @fct_done = ();
@@ -10308,7 +10417,7 @@ sub _get_procedures
 	$sql .= " " . $self->limit_to_objects('PROCEDURE','NAME');
 	$sql .= " ORDER BY OWNER,NAME,LINE";
 	$sth = $self->{dbh}->prepare($sql) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $sth->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $sth->errstr . "\n", 0, 1);
 	while (my $row = $sth->fetch) {
 		if (!$self->{schema} && $self->{export_schema}) {
 			$row->[0] = "$row->[1].$row->[0]";
@@ -10347,7 +10456,7 @@ sub _get_packages
 	$str .= " ORDER BY OBJECT_NAME";
 
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my %packages = ();
 	my @fct_done = ();
@@ -10392,7 +10501,7 @@ sub _get_types
 	my ($self, $dbh, $name) = @_;
 
 	# Retrieve all user defined types
-	my $str = "SELECT DISTINCT OBJECT_NAME,OWNER FROM $self->{prefix}_OBJECTS WHERE OBJECT_TYPE='TYPE'";
+	my $str = "SELECT DISTINCT OBJECT_NAME,OWNER,OBJECT_ID FROM $self->{prefix}_OBJECTS WHERE OBJECT_TYPE='TYPE'";
 	$str .= " AND STATUS='VALID'" if (!$self->{export_invalid});
 	$str .= " AND OBJECT_NAME='$name'" if ($name);
 	$str .= " AND GENERATED='N'";
@@ -10401,11 +10510,15 @@ sub _get_types
 	} else {
 		$str .= "AND OWNER NOT IN ('" . join("','", @{$self->{sysusers}}) . "') ";
 	}
-	$str .= $self->limit_to_objects('TYPE', 'OBJECT_NAME') if (!$name);
+	if (!$name) {
+		$str .= $self->limit_to_objects('TYPE', 'OBJECT_NAME');
+	} else {
+		@{$self->{query_bind_params}} = ();
+	}
 	$str .= " ORDER BY OBJECT_NAME";
 
 	my $sth = $dbh->prepare($str) or $self->logit("FATAL: " . $dbh->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $dbh->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $dbh->errstr . "\n", 0, 1);
 
 	my @types = ();
 	my @fct_done = ();
@@ -10425,6 +10538,7 @@ sub _get_types
 		}
 		$tmp{name} = $row->[0];
 		$tmp{owner} = $row->[1];
+		$tmp{pos} = $row->[2];
 		push(@types, \%tmp);
 	}
 
@@ -10462,7 +10576,7 @@ sub _table_info
 		}
 		$sql .= $self->limit_to_objects('TABLE', 'A.TABLE_NAME');
 		my $sth = $self->{dbh}->prepare( $sql ) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-		$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+		$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 		while (my $row = $sth->fetch) {
 			if (!$self->{schema} && $self->{export_schema}) {
 				$row->[0] = "$row->[3].$row->[0]";
@@ -10486,7 +10600,7 @@ sub _table_info
         $sql .= " AND (A.IOT_TYPE IS NULL OR A.IOT_TYPE = 'IOT') ORDER BY A.OWNER, A.TABLE_NAME";
 
         my $sth = $self->{dbh}->prepare( $sql ) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-        $sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+        $sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 	my %tables_infos = ();
 	while (my $row = $sth->fetch) {
 		if (!$self->{schema} && $self->{export_schema}) {
@@ -10508,7 +10622,8 @@ sub _table_info
 		} else {
 			$tables_infos{$row->[1]}{partitioned} = 1;
 		}
-		if (($row->[7] || 0) > 0) {
+		# Only take care of PCTFREE upper than the Oracle default value
+		if (($row->[7] || 0) > 10) {
 			$tables_infos{$row->[1]}{fillfactor} = 100 - min(90, $row->[7]);
 		}
 		if ($do_real_row_count) {
@@ -10558,7 +10673,7 @@ sub _global_temp_table_info
 	}
 	$sql .= $self->limit_to_objects('TABLE', 'A.TABLE_NAME');
 	my $sth = $self->{dbh}->prepare( $sql ) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 	while (my $row = $sth->fetch) {
 		if (!$self->{schema} && $self->{export_schema}) {
 			$row->[0] = "$row->[3].$row->[0]";
@@ -10577,7 +10692,7 @@ sub _global_temp_table_info
         $sql .= " AND (A.IOT_TYPE IS NULL OR A.IOT_TYPE = 'IOT') ORDER BY A.OWNER, A.TABLE_NAME";
 
         $sth = $self->{dbh}->prepare( $sql ) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-        $sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+        $sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 	my %tables_infos = ();
 	while (my $row = $sth->fetch) {
 		if (!$self->{schema} && $self->{export_schema}) {
@@ -10714,7 +10829,7 @@ AND a.TABLESPACE_NAME = c.TABLESPACE_NAME
 	$str .= $self->limit_to_objects('TABLESPACE|TABLE', 'a.TABLESPACE_NAME|a.SEGMENT_NAME');
 	$str .= " ORDER BY TABLESPACE_NAME";
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my %tbs = ();
 	while (my $row = $sth->fetch) {
@@ -10756,7 +10871,7 @@ WHERE a.TABLESPACE_NAME = c.TABLESPACE_NAME
 	$str .= $self->limit_to_objects('TABLESPACE', 'c.TABLESPACE_NAME');
 	$str .= " ORDER BY c.TABLESPACE_NAME";
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my %tbs = ();
 	while (my $row = $sth->fetch) {
@@ -10803,7 +10918,7 @@ SELECT
 FROM $self->{prefix}_TAB_PARTITIONS A, $self->{prefix}_PART_TABLES B, $self->{prefix}_PART_KEY_COLUMNS C
 WHERE
 	a.table_name = b.table_name AND
-	(b.partitioning_type = 'RANGE' OR b.partitioning_type = 'LIST')
+	(b.partitioning_type = 'RANGE' OR b.partitioning_type = 'LIST' OR b.partitioning_type = 'HASH')
 	AND a.table_name = c.name
 };
 
@@ -10822,7 +10937,7 @@ WHERE
 	$str .= "ORDER BY A.TABLE_OWNER,A.TABLE_NAME,A.PARTITION_POSITION,C.COLUMN_POSITION\n";
 
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my %parts = ();
 	my %default = ();
@@ -10848,6 +10963,7 @@ WHERE
 
 This function implements an Oracle-native subpartitions information.
 Return two hash ref with partition details and partition default.
+
 =cut
 
 sub _get_subpartitions
@@ -10877,7 +10993,7 @@ SELECT
 FROM $self->{prefix}_tab_subpartitions A, $self->{prefix}_part_tables B, $self->{prefix}_subpart_key_columns C
 WHERE
 	a.table_name = b.table_name AND
-	(b.subpartitioning_type = 'RANGE' OR b.subpartitioning_type = 'LIST')
+	(b.subpartitioning_type = 'RANGE' OR b.subpartitioning_type = 'LIST' OR b.subpartitioning_type = 'HASH')
 	AND a.table_name = c.name
 };
 	$str .= $self->limit_to_objects('TABLE|PARTITION', 'A.TABLE_NAME|A.SUBPARTITION_NAME');
@@ -10895,7 +11011,7 @@ WHERE
 	$str .= "ORDER BY A.TABLE_OWNER,A.TABLE_NAME,A.PARTITION_NAME,A.SUBPARTITION_POSITION,C.COLUMN_POSITION\n";
 
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my %subparts = ();
 	my %default = ();
@@ -10969,7 +11085,7 @@ sub _get_synonyms
 
 
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my %synonyms = ();
 	while (my $row = $sth->fetch) {
@@ -11031,7 +11147,7 @@ WHERE A.TABLE_NAME = B.TABLE_NAME
 	$str .= "ORDER BY A.TABLE_NAME\n";
 
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my %parts = ();
 	while (my $row = $sth->fetch) {
@@ -11069,7 +11185,7 @@ SELECT
 	C.COLUMN_POSITION
 FROM $self->{prefix}_PART_TABLES B, $self->{prefix}_PART_KEY_COLUMNS C
 WHERE B.TABLE_NAME = C.NAME
-	AND (b.partitioning_type = 'RANGE' OR b.partitioning_type = 'LIST')
+	AND (b.partitioning_type = 'RANGE' OR b.partitioning_type = 'LIST' OR b.partitioning_type = 'HASH')
 };
 	$str .= $self->limit_to_objects('TABLE','B.TABLE_NAME');
 
@@ -11086,7 +11202,7 @@ WHERE B.TABLE_NAME = C.NAME
 	$str .= "ORDER BY B.OWNER,B.TABLE_NAME,C.COLUMN_POSITION\n";
 
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my %parts = ();
 	while (my $row = $sth->fetch) {
@@ -11133,7 +11249,7 @@ SELECT
 FROM $self->{prefix}_TAB_SUBPARTITIONS A, $self->{prefix}_PART_TABLES B, $self->{prefix}_SUBPART_KEY_COLUMNS C
 WHERE 
         a.table_name = b.table_name AND
-        (b.subpartitioning_type = 'RANGE' OR b.subpartitioning_type = 'LIST')
+        (b.subpartitioning_type = 'RANGE' OR b.subpartitioning_type = 'LIST' OR b.subpartitioning_type = 'HASH')
         AND a.table_name = c.name
 
 };
@@ -11152,7 +11268,7 @@ WHERE
 	$str .= "ORDER BY A.TABLE_OWNER,A.TABLE_NAME,A.PARTITION_NAME,A.SUBPARTITION_POSITION,C.COLUMN_POSITION\n";
 
 	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute(@{$self->{query_bind_params}}) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 
 	my %parts = ();
 	while (my $row = $sth->fetch) {
@@ -11825,14 +11941,18 @@ is set to 1.
 
 sub _convert_package
 {
-	my ($self, $plsql, $owner) = @_;
+	my ($self, $pkg) = @_;
+
+	return if (!$pkg || !exists $self->{packages}{$pkg}{text});
+
+	my $owner = $self->{packages}{$pkg}{owner} || '';
 
 	my $dirprefix = '';
 	$dirprefix = "$self->{output_dir}/" if ($self->{output_dir});
 	my $content = '';
 
-	if ($self->{package_as_schema} && ($plsql =~ /PACKAGE\s+BODY\s*([^\s]+)(?:\s*\%ORA2PG_COMMENT\d+\%)*\s*(AS|IS)\s*/is)) {
-		my $pname =  $self->quote_object_name($1);
+	if ($self->{package_as_schema}) {
+		my $pname =  $self->quote_object_name($pkg);
 		$pname =~ s/^[^\.]+\.//;
 		$content .= "\nDROP SCHEMA $self->{pg_supports_ifexists} $pname CASCADE;\n";
 		$content .= "CREATE SCHEMA $pname;\n";
@@ -11843,9 +11963,43 @@ sub _convert_package
 			}
 		}
 	}
+	# Grab global declaration from the package header
+	if ($self->{packages}{$pkg}{desc} =~ /CREATE OR REPLACE PACKAGE\s+([^\s]+)(?:\s*\%ORA2PG_COMMENT\d+\%)*\s*(AS|IS)\s*(.*)/is) {
+
+		my $pname = $1;
+		my $type = $2;
+		my $glob_declare = $3;
+
+		$pname =~ s/"//g;
+		$pname =~ s/^.*\.//g;
+		$self->logit("Looking global declaration in package $pname...\n", 1);
+
+		# Process package spec to extract global variables
+		if ($glob_declare) {
+			my @cursors = ();
+			($glob_declare, @cursors) = $self->clear_global_declaration($pname, $glob_declare, 0);
+			# Then dump custom type
+			foreach my $tpe (sort {$a->{pos} <=> $b->{pos}} @{$self->{types}}) {
+				$self->logit("Dumping type $tpe->{name}...\n", 1);
+				if ($self->{plsql_pgsql}) {
+					$tpe->{code} = $self->_convert_type($tpe->{code}, $tpe->{owner}, %{$self->{pkg_type}{$pname}});
+				} else {
+					if ($tpe->{code} !~ /^SUBTYPE\s+/i) {
+						$tpe->{code} = "CREATE$self->{create_or_replace} $tpe->{code}\n";
+					}
+				}
+				$tpe->{code} =~ s/REPLACE type/REPLACE TYPE/;
+				$content .= $tpe->{code} . "\n";
+				$i++;
+			}
+			$content .= join("\n", @cursors) . "\n";
+			$glob_declare = $self->register_global_variable($pname, $glob_declare);
+		}
+		@{$self->{types}} = ();
+	}
 
 	# Convert the package body part
-	if ($plsql =~ /CREATE OR REPLACE PACKAGE\s+BODY\s*([^\s]+)(?:\s*\%ORA2PG_COMMENT\d+\%)*\s*(AS|IS)\s*(.*)/is) {
+	if ($self->{packages}{$pkg}{text} =~ /CREATE OR REPLACE PACKAGE\s+BODY\s*([^\s]+)(?:\s*\%ORA2PG_COMMENT\d+\%)*\s*(AS|IS)\s*(.*)/is) {
 
 		my $pname = $1;
 		my $type = $2;
@@ -11856,39 +12010,22 @@ sub _convert_package
 		$pname =~ s/^.*\.//g;
 		$self->logit("Dumping package $pname...\n", 1);
 
-		# Append globals package declarations
-		if (exists $self->{pkg_content}{$pname}) {
-			$content .= $self->{pkg_content}{$pname};
-			delete $self->{pkg_content}{$pname};
-		}
-
 		# Process package spec to extract global variables
 		if ($glob_declare) {
-			# Remove all function/procedure declaration
-			while ($glob_declare =~ s/(PROCEDURE|FUNCTION).*?(PROCEDURE|FUNCTION)/$2/igs) {};
-			$glob_declare =~ s/(PROCEDURE|FUNCTION).*END[^;]*;//is;
-			# Remove end of the package decalaration
-			$glob_declare =~ s/\s+END[^;]*;\s*$//igs;
-			$glob_declare =~ s/\s+END[^;]*;//igs;
 			my @cursors = ();
-			while ($glob_declare =~ s/(CURSOR\s+[^;]+\s+RETURN\s+[^;]+;)//) {
-				push(@cursors, $1);
-			}
-			# Extract TYPE declaration
-			my $i = 0;
-			while ($glob_declare =~ s/TYPE\s+([^\s]+)\s+(AS|IS)\s+([^;]+;)//) {
-				$self->{pkg_type}{$1} = "$pname.$1";
-				my $code = "TYPE $self->{pkg_type}{$1} AS $3";
-				push(@{$self->{types}}, { ('name' => $1, 'code' => $code, 'pos' => $i++) });
-			}
+			($glob_declare, @cursors) = $self->clear_global_declaration($pname, $glob_declare, 1);
 			# Then dump custom type
 			foreach my $tpe (sort {$a->{pos} <=> $b->{pos}} @{$self->{types}}) {
+				next if (!exists $self->{pkg_type}{$pname}{$tpe->{name}});
 				$self->logit("Dumping type $tpe->{name}...\n", 1);
 				if ($self->{plsql_pgsql}) {
-					$tpe->{code} = $self->_convert_type($tpe->{code}, $tpe->{owner}, %{$self->{pkg_type}});
+					$tpe->{code} = $self->_convert_type($tpe->{code}, $tpe->{owner}, %{$self->{pkg_type}{$pname}});
 				} else {
-					$tpe->{code} = "CREATE$self->{create_or_replace} $tpe->{code}\n";
+					if ($tpe->{code} !~ /^SUBTYPE\s+/i) {
+						$tpe->{code} = "CREATE$self->{create_or_replace} $tpe->{code}\n";
+					}
 				}
+				$tpe->{code} =~ s/REPLACE type/REPLACE TYPE/;
 				$content .= $tpe->{code} . "\n";
 				$i++;
 			}
@@ -11945,53 +12082,9 @@ sub _convert_package
 			$self->{total_pkgcost} += $self->{pkgcost} || 0;
 		}
 
-	# Grab global declaration from the package header
-	} elsif ($plsql =~ /CREATE OR REPLACE PACKAGE\s+([^\s]+)(?:\s*\%ORA2PG_COMMENT\d+\%)*\s*(AS|IS)\s*(.*)/is) {
-
-		my $pname = $1;
-		my $type = $2;
-		my $glob_declare = $3;
-
-		$pname =~ s/"//g;
-		$pname =~ s/^.*\.//g;
-		$self->logit("Looking global declaration in package $pname...\n", 1);
-
-		# Process package spec to extract global variables
-		if ($glob_declare) {
-			# Remove all function declaration
-			$glob_declare =~ s/(PROCEDURE|FUNCTION)[^;]+;//gis;
-			# Remove end of the package decalaration
-			$glob_declare =~ s/\s+END[^;]*;.*//is;
-			$glob_declare =~ s/\%ORA2PG_COMMENT\d+\%//igs;
-			$glob_declare =~ s/[\r\n]+/\n/isg;
-			my @cursors = ();
-			while ($glob_declare =~ s/(CURSOR\s+[^;]+\s+RETURN\s+[^;]+;)//) {
-				push(@cursors, $1);
-			}
-			# Extract TYPE declaration
-			my $i = 0;
-			while ($glob_declare =~ s/TYPE\s+([^\s]+)\s+(AS|IS)\s+([^;]+;)//is) {
-				$self->{pkg_type}{$1} = "$pname.$1";
-				my $code = "TYPE $self->{pkg_type}{$1} AS $3";
-				push(@{$self->{types}}, { ('name' => $1, 'code' => $code, 'pos' => $i++) });
-			}
-			# Then dump custom type
-			foreach my $tpe (sort {$a->{pos} <=> $b->{pos}} @{$self->{types}}) {
-				$self->logit("Dumping type $tpe->{name}...\n", 1);
-				if ($self->{plsql_pgsql}) {
-					$tpe->{code} = $self->_convert_type($tpe->{code}, $tpe->{owner}, %{$self->{pkg_type}});
-				} else {
-					$tpe->{code} = "CREATE$self->{create_or_replace} $tpe->{code}\n";
-				}
-				$self->{pkg_content}{$pname} .= $tpe->{code} . "\n";
-				$i++;
-			}
-			$self->{pkg_content}{$pname} .= join("\n", @cursors) . "\n";
-			$glob_declare = $self->register_global_variable($pname, $glob_declare);
-			@{$self->{types}} = ();
-		}
-		return;
 	}
+
+	@{$self->{types}} = ();
 
 	return $content;
 }
@@ -12051,6 +12144,13 @@ sub _remove_comments
 	my @lines = split(/([\n\r]+)/, $$content);
 	for (my $i = 0; $i <= $#lines; $i++) {
 		next if ($lines[$i] !~ /\S/);
+
+		# ex:		v := 'literal'    -- commentaire avec un ' guillemet
+		if ($lines[$i] =~ s/^([^']+'[^']*'\s*)(\-\-.*)$/$1\%ORA2PG_COMMENT$self->{idxcomment}\%/) {
+			$self->{comment_values}{"\%ORA2PG_COMMENT$self->{idxcomment}\%"} = $2;
+			$self->{idxcomment}++;
+		}
+
 		# ex:       ---/* REN 16.12.2010 ZKOUSKA TEST NA KOLURC
 		if ($lines[$i] =~ s/^(\s*)(\-\-(?:(?!\*\/\s*$).)*)$/$1\%ORA2PG_COMMENT$self->{idxcomment}\%/) {
 			$self->{comment_values}{"\%ORA2PG_COMMENT$self->{idxcomment}\%"} = $2;
@@ -12242,22 +12342,28 @@ sub _convert_function
 		# Remove the pragma when a conversion is done
 		$fct_detail{declare} =~ s/--\s+PRAGMA\s+AUTONOMOUS_TRANSACTION[\s;]*//is;
 		my @tmp = split(',', $fct_detail{args});
+		$tmp[0] =~ s/^\(//;
+		$tmp[-1] =~ s/\)$//;
 		foreach my $p (@tmp) {
-			if ($p =~ s/\s*OUT\s+//) {
+			if ($p =~ s/\bOUT\s+//) {
 				$at_inout++;
 				push(@at_ret_param, $p);
 				push(@at_ret_type, $p);
-			} elsif ($p =~ s/\s*INOUT\s+//) {
+			} elsif ($p =~ s/\bINOUT\s+//) {
 				$at_inout++;
 				push(@at_ret_param, $p);
 				push(@at_ret_type, $p);
 			}
 		}
 		map { s/^(.*?) //; } @at_ret_type;
-		if ($#at_ret_param < 0) {
+		if ($fct_detail{hasreturn} && $#at_ret_param < 0) {
 			push(@at_ret_param, 'ret ' . $fct_detail{func_ret_type});
 			push(@at_ret_type, $fct_detail{func_ret_type});
 		}
+		map { s/^\s+//; } @at_ret_param;
+		map { s/\s+$//; } @at_ret_param;
+		map { s/^\s+//; } @at_ret_type;
+		map { s/\s+$//; } @at_ret_type;
 	}
 
 	my $name = $fname;
@@ -12299,21 +12405,67 @@ CREATE EXTENSION IF NOT EXISTS dblink;
 	v_conn_str  text := $dblink_conn;
 	v_query     text;
 };
-		if (!$fct_detail{hasreturn}) {
-			$at_wrapper .= qq{
+		if ($#at_ret_param == 0) {
+			my $varname = $at_ret_param[0];
+			$varname =~ s/\s+.*//;
+			my $vartype = $at_ret_type[0];
+			$vartype =~ s/.*\s+//;
+			if (!$fct_detail{hasreturn}) {
+				$at_wrapper .= qq{
 BEGIN
-	v_query := 'SELECT true FROM $fname$at_suffix ($params)';
-	PERFORM * FROM dblink(v_conn_str, v_query) AS p (ret boolean);
+	v_query := 'SELECT * FROM $fname$at_suffix ($params)';
+	SELECT v_ret INTO $varname FROM dblink(v_conn_str, v_query) AS p (v_ret $vartype);
 };
-		} elsif ($#at_ret_param == 0) {
-			my $prm = join(',', @at_ret_param);
-			$at_wrapper .= qq{
+			} else {
+				$at_ret_type[0] = $fct_detail{func_ret_type};
+				$at_ret_param[0] = 'ret ' . $fct_detail{func_ret_type};
+				$at_wrapper .= qq{
 	v_ret	$at_ret_type[0];
 BEGIN
 	v_query := 'SELECT * FROM $fname$at_suffix ($params)';
 	SELECT * INTO v_ret FROM dblink(v_conn_str, v_query) AS p ($at_ret_param[0]);
 	RETURN v_ret;
 };
+			}
+		} elsif ($#at_ret_param > 0) {
+			my $varnames = '';
+			my $vartypes = '';
+			for (my $i = 0; $i <= $#at_ret_param; $i++) {
+				my $v = $at_ret_param[$i];
+				$v =~ s/\s+.*//;
+				$varnames .= "$v, ";
+				$vartypes .= "v_ret$i ";
+				my $t = $at_ret_type[$i];
+				$t =~ s/.*\s+//;
+				$vartypes .= "$t, ";
+			}
+			$varnames =~ s/, $//;
+			$vartypes =~ s/, $//;
+			if (!$fct_detail{hasreturn}) {
+				$at_wrapper .= qq{
+BEGIN
+	v_query := 'SELECT * FROM $fname$at_suffix ($params)';
+	SELECT * FROM dblink(v_conn_str, v_query) AS p ($vartypes) INTO $varnames;
+};
+			} else {
+				$at_ret_type[0] = $fct_detail{func_ret_type};
+				$at_ret_param[0] = 'ret ' . $fct_detail{func_ret_type};
+				$at_wrapper .= qq{
+	v_ret	$at_ret_type[0];
+BEGIN
+	v_query := 'SELECT * FROM $fname$at_suffix ($params)';
+	SELECT * INTO v_ret FROM dblink(v_conn_str, v_query) AS p ($at_ret_param[0]);
+	RETURN v_ret;
+};
+			}
+		} elsif (!$fct_detail{hasreturn}) {
+			$at_wrapper .= qq{
+BEGIN
+	v_query := 'SELECT true FROM $fname$at_suffix ($params)';
+	PERFORM * FROM dblink(v_conn_str, v_query) AS p (ret boolean);
+};
+		} else {
+			print STDERR "WARNING: we should not be there, please send the Oracle code of the $self->{type} to the author for debuging.\n";
 		}
 		$at_wrapper .= qq{
 END;
@@ -12676,6 +12828,13 @@ sub _convert_type
 	my $unsupported = "-- Unsupported, please edit to match PostgreSQL syntax\n";
 	my $content = '';
 	my $type_name = '';
+
+	# Replace SUBTYPE declaration into DOMAIN declaration
+        if ($plsql =~ s/SUBTYPE\s+/CREATE DOMAIN /i) {
+		$plsql =~ s/\s+IS\s+/ AS /;
+		$plsql = Ora2Pg::PLSQL::replace_sql_type($plsql, $self->{pg_numeric_type}, $self->{default_numeric}, $self->{pg_integer_type}, %{$self->{data_type}});
+		return $plsql;
+	}
 
 	$plsql =~ s/\s*INDEX\s+BY\s+([^\s;]+)//is;
 	if ($plsql =~ /TYPE\s+([^\s]+)\s+(IS|AS)\s*TABLE\s*OF\s+(.*)/is) {
@@ -13738,7 +13897,9 @@ sub _show_infos
 		# Convert Oracle user defined type to PostgreSQL
 		if (!$self->{is_mysql}) {
 			$self->_types();
-			foreach my $tpe (sort {length($a->{name}) <=> length($b->{name}) } @{$self->{types}}) {
+			foreach my $tpe (sort { $a->{pos} <=> $b->{pos} } @{$self->{types}}) {
+				# We dont want the result but only the array @{$self->{types}}
+				# define in the _convert_type() function
 				$self->_convert_type($tpe->{code}, $tpe->{owner});
 			}
 		}
@@ -15492,7 +15653,7 @@ sub _get_largest_tables
 	}
 
         my $sth = $self->{dbh}->prepare( $sql ) or return undef;
-        $sth->execute or return undef;
+        $sth->execute(@{$self->{query_bind_params}}) or return undef;
 	while ( my @row = $sth->fetchrow()) {
 		$table_size{$row[0]} = $row[1];
 	}
@@ -15933,6 +16094,10 @@ return 0;
 	return $found;
 }
 
+# Construct a query to exclude or only include some object wanted by the user
+# following the ALLOW and EXCLUDE configuration directive. The filter returned
+# must be used with the bind parameters stored in the @{$self->{query_bind_params}}
+# when calling the execute() function after the call of prepare().
 sub limit_to_objects
 {
 	my ($self, $obj_type, $column) = @_;
@@ -15945,6 +16110,8 @@ sub limit_to_objects
 	my @arr_type = split(/\|/, $obj_type);
 	my @done = ();
 	my $has_limitation = 0;
+	$self->{query_bind_params} = ();
+
 	for (my $i = 0; $i <= $#arr_type; $i++) {
 
 		my $colname = $cols[0];
@@ -15963,7 +16130,8 @@ sub limit_to_objects
 						$have_lookahead = 1;
 						next;
 					}
-					$str .= "upper($colname) LIKE \U'$self->{limited}{$arr_type[$i]}->[$j]'\E";
+					$str .= "upper($colname) LIKE ?";
+					push(@{$self->{query_bind_params}}, uc($self->{limited}{$arr_type[$i]}->[$j]));
 					if ($j < $#{$self->{limited}{$arr_type[$i]}}) {
 						$str .= " OR ";
 					}
@@ -15976,10 +16144,11 @@ sub limit_to_objects
 						next;
 					}
 					if ($self->{is_mysql}) {
-						$str .= "upper($colname) RLIKE '\^$self->{limited}{$arr_type[$i]}->[$j]\$'" ;
+						$str .= "upper($colname) RLIKE ?" ;
 					} else {
-						$str .= "REGEXP_LIKE(upper($colname),'\^$self->{limited}{$arr_type[$i]}->[$j]\$')" ;
+						$str .= "REGEXP_LIKE(upper($colname), ?)" ;
 					}
+					push(@{$self->{query_bind_params}}, uc("\^$self->{limited}{$arr_type[$i]}->[$j]\$"));
 					if ($j < $#{$self->{limited}{$arr_type[$i]}}) {
 						$str .= " OR ";
 					}
@@ -15994,16 +16163,18 @@ sub limit_to_objects
 				if ($self->{db_version} =~ /Release [89]/) {
 					for (my $j = 0; $j <= $#{$self->{limited}{$arr_type[$i]}}; $j++) {
 						next if ($self->{limited}{$arr_type[$i]}->[$j] !~ /^\!(.+)/);
-						$str .= " AND upper($colname) NOT LIKE \U'$1'\E";
+						$str .= " AND upper($colname) NOT LIKE ?";
+						push(@{$self->{query_bind_params}}, uc($1));
 					}
 				} else {
 					for (my $j = 0; $j <= $#{$self->{limited}{$arr_type[$i]}}; $j++) {
 						next if ($self->{limited}{$arr_type[$i]}->[$j] !~ /^\!(.+)/);
 						if ($self->{is_mysql}) {
-							$str .= " AND upper($colname) NOT RLIKE '\^$1\$'" ;
+							$str .= " AND upper($colname) NOT RLIKE ?" ;
 						} else {
-							$str .= " AND NOT REGEXP_LIKE(upper($colname),'\^$1\$')" ;
+							$str .= " AND NOT REGEXP_LIKE(upper($colname), ?)" ;
 						}
+						push(@{$self->{query_bind_params}}, uc("\^$1\$"));
 					}
 				}
 
@@ -16015,7 +16186,8 @@ sub limit_to_objects
 			if ($self->{db_version} =~ /Release [89]/) {
 				$str .= ' AND (';
 				for (my $j = 0; $j <= $#{$self->{excluded}{$arr_type[$i]}}; $j++) {
-					$str .= "upper($colname) NOT LIKE \U'$self->{excluded}{$arr_type[$i]}->[$j]'\E" ;
+					$str .= "upper($colname) NOT LIKE ?" ;
+					push(@{$self->{query_bind_params}}, uc($self->{excluded}{$arr_type[$i]}->[$j]));
 					if ($j < $#{$self->{excluded}{$arr_type[$i]}}) {
 						$str .= " AND ";
 					}
@@ -16025,10 +16197,11 @@ sub limit_to_objects
 				$str .= ' AND (';
 				for (my $j = 0; $j <= $#{$self->{excluded}{$arr_type[$i]}}; $j++) {
 					if ($self->{is_mysql}) {
-						$str .= "upper($colname) NOT RLIKE '\^$self->{excluded}{$arr_type[$i]}->[$j]\$'" ;
+						$str .= "upper($colname) NOT RLIKE ?" ;
 					} else {
-						$str .= "NOT REGEXP_LIKE(upper($colname),'\^$self->{excluded}{$arr_type[$i]}->[$j]\$')" ;
+						$str .= "NOT REGEXP_LIKE(upper($colname), ?)" ;
 					}
+					push(@{$self->{query_bind_params}}, uc("\^$self->{excluded}{$arr_type[$i]}->[$j]\$"));
 					if ($j < $#{$self->{excluded}{$arr_type[$i]}}) {
 						$str .= " AND ";
 					}
@@ -16042,17 +16215,19 @@ sub limit_to_objects
 			if ($self->{db_version} =~ /Release [89]/) {
 				$str .= ' AND (';
 				foreach my $t (@EXCLUDED_TABLES_8I) {
-					$str .= " AND upper($colname) NOT LIKE \U'$t'\E";
+					$str .= " AND upper($colname) NOT LIKE ?";
+					push(@{$self->{query_bind_params}}, uc($t));
 				}
 				$str .= ')';
 			} else {
 				$str .= ' AND ( ';
 				for (my $j = 0; $j <= $#EXCLUDED_TABLES; $j++) {
 					if ($self->{is_mysql}) {
-						$str .= " upper($colname) NOT RLIKE '\^$EXCLUDED_TABLES[$j]\$'" ;
+						$str .= " upper($colname) NOT RLIKE ?" ;
 					} else {
-						$str .= " NOT REGEXP_LIKE(upper($colname),'\^$EXCLUDED_TABLES[$j]\$')" ;
+						$str .= " NOT REGEXP_LIKE(upper($colname), ?)" ;
 					}
+					push(@{$self->{query_bind_params}}, uc("\^$EXCLUDED_TABLES[$j]\$"));
 					if ($j < $#EXCLUDED_TABLES){
 						$str .= " AND ";
 					}
@@ -16190,6 +16365,9 @@ sub _lookup_function
 	return if (!$fct_detail{code});
 
 	@{$fct_detail{param_types}} = ();
+	$fct_detail{declare} =~ s/(\b(?:FUNCTION|PROCEDURE)\s+(?:[^\s\(]+))(\s*\%ORA2PG_COMMENT\d+\%\s*)+/$2$1 /is;
+	#if ( ($fct_detail{declare} =~ s/(.*?)\b(FUNCTION|PROCEDURE)\s+([^\s\(]+)(?:\s*\%ORA2PG_COMMENT\d+\%)*\s*(\([^\)]*\))//is) || 
+	#($fct_detail{declare} =~ s/(.*?)\b(FUNCTION|PROCEDURE)\s+([^\s\(]+)(?:\s*\%ORA2PG_COMMENT\d+\%)*\s+(RETURN|IS|AS)/$4/is) ) {
 	if ( ($fct_detail{declare} =~ s/(.*?)\b(FUNCTION|PROCEDURE)\s+([^\s\(]+)\s*(\([^\)]*\))//is) || 
 	($fct_detail{declare} =~ s/(.*?)\b(FUNCTION|PROCEDURE)\s+([^\s\(]+)\s+(RETURN|IS|AS)/$4/is) ) {
 		$fct_detail{before} = $1;
@@ -17300,6 +17478,42 @@ sub escape_insert
 	return $col;
 }
 
+sub clear_global_declaration
+{
+	my ($self, $pname, $str, $is_pkg_body) = @_;
+
+	# Remove comment
+	$str =~ s/\%ORA2PG_COMMENT\d+\%//igs;
+
+	# Remove all function/procedure declaration from the content
+	if (!$is_pkg_body) {
+		$str =~ s/\b(PROCEDURE|FUNCTION)\s+[^;]+;//igs;
+	} else {
+		while ($str =~ s/\b(PROCEDURE|FUNCTION)\s+.*?END[^;]*;((?:(?!\bEND\b).)*\s+(?:PROCEDURE|FUNCTION)\s+)/$2/is) {
+		};
+		$str =~ s/(PROCEDURE|FUNCTION).*END[^;]*;//is;
+	}
+	# Remove end of the package declaration
+	$str =~ s/\s+END[^;]*;\s*$//igs;
+	# Eliminate extra newline
+	$str =~ s/[\r\n]+/\n/isg;
+
+	my @cursors = ();
+	while ($str =~ s/(CURSOR\s+[^;]+\s+RETURN\s+[^;]+;)//is) {
+		push(@cursors, $1);
+	}
+	# Extract TYPE/SUBTYPE declaration
+	my $i = 0;
+	while ($str =~ s/(SUBTYPE|TYPE)\s+([^\s]+)\s+(AS|IS)\s+([^;]+;)//is) {
+		$self->{pkg_type}{$pname}{$2} = "$pname.$2";
+		my $code = "$1 $self->{pkg_type}{$pname}{$2} AS $4";
+		push(@{$self->{types}}, { ('name' => $2, 'code' => $code, 'pos' => $i++) });
+	}
+
+	return ($str, @cursors);
+}
+
+
 sub register_global_variable
 {
 	my ($self, $pname, $glob_vars) = @_;
@@ -17432,6 +17646,13 @@ sub _make_WITH
 	$WITH .= 'WITH (' . join(",",@withs) . ')';
     }
     return $WITH;
+}
+
+sub min
+{
+	return $_[0] if ($_[0] < $_[1]);
+
+	return $_[1];
 }
 
 1;
