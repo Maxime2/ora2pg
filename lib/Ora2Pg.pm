@@ -1170,6 +1170,15 @@ sub _init
 	$self->{parallel_tables} ||= 0;
 	$self->{no_lob_locator} = 1 if ($self->{no_lob_locator} ne '0');
 
+	# Transformation and output during data export
+	$self->{oracle_speed} ||= 0;
+	$self->{ora2pg_speed} ||= 0;
+	if (($self->{oracle_speed} || $self->{ora2pg_speed}) && !grep(/^$self->{type}$/, 'COPY', 'INSERT', 'DATA')) {
+		# No output is only available for data export.
+		die "FATAL: --oracle_speed or --ora2pg_speed can only be use with data export.\n";
+	}
+	$self->{oracle_speed} = 1 if ($self->{ora2pg_speed});
+
 	# Shall we prefix function with a schema name to emulate a package?
 	$self->{package_as_schema} = 1 if (not exists $self->{package_as_schema} || ($self->{package_as_schema} eq ''));
 	$self->{package_functions} = ();
@@ -1777,6 +1786,8 @@ sub _send_to_pgdb
 	my ($self) = @_;
 
 	eval("use DBD::Pg qw(:pg_types);");
+
+	return if ($self->{oracle_speed});
 
         # Connect the destination database
         my $dbhdest = DBI->connect($self->{pg_dsn}, $self->{pg_user}, $self->{pg_pwd}, {AutoInactiveDestroy => 1});
@@ -3055,7 +3066,8 @@ sub read_dblink_from_file
 		$d_name =~ s/"//g;
 		$d_user =~ s/"//g;
 		$self->{dblink}{$d_name}{owner} = $self->{shema};
-		$self->{dblink}{$d_name}{username} = $d_user;
+		$self->{dblink}{$d_name}{user} = $d_user;
+		$self->{dblink}{$d_name}{username} = $self->{pg_user} || $d_user;
 		if ($d_auth =~ s/USING\s+([^\s]+)//) {
 			$self->{dblink}{$d_name}{host} = $1;
 			$self->{dblink}{$d_name}{host} =~ s/'//g;
@@ -3066,6 +3078,7 @@ sub read_dblink_from_file
 		if ($d_auth =~ s/AUTHENTICATED\s+BY\s+([^\s]+)\s+IDENTIFIED\s+BY\s+([^\s]+)//) {
 			$self->{dblink}{$d_name}{user} = $1;
 			$self->{dblink}{$d_name}{password} = $2;
+			$self->{dblink}{$d_name}{username} = $self->{pg_user} || $1;
 		}
 	}
 
@@ -3360,7 +3373,7 @@ sub _export_table_data
 	if ($self->{truncate_table} && !$self->{global_delete} && !exists $self->{delete}{"\L$table\E"}) {
 		# Set search path
 		my $search_path = $self->set_search_path();
-		if ($self->{pg_dsn}) {
+		if ($self->{pg_dsn} && !$self->{oracle_speed}) {
 			if ($search_path) {
 				$local_dbh->do($search_path) or $self->logit("FATAL: " . $local_dbh->errstr . "\n", 0, 1);
 			}
@@ -3458,11 +3471,11 @@ sub _export_table_data
 
  	# close the connection with parallel table export
  	if (($self->{parallel_tables} > 1) && $self->{pg_dsn}) {
- 		$local_dbh->disconnect();
+ 		$local_dbh->disconnect() if (defined $local_dbh);
  	}
 
 	# Rename temporary filename into final name
-	$self->rename_dump_partfile($dirprefix, $table);
+	$self->rename_dump_partfile($dirprefix, $table) if (!$self->{oracle_speed});
 
 	return $total_record;
 }
@@ -4223,7 +4236,6 @@ LANGUAGE plpgsql ;
 				$self->{dblink}{$db}{password} ||= 'secret';
 				$self->{dblink}{$db}{password} = ", password '$self->{dblink}{$db}{password}'";
 			}
-			$self->{dblink}{$db}{user} ||= $self->{dblink}{$db}{username};
 			if ($self->{dblink}{$db}{username}) {
 				$sql_output .= "CREATE USER MAPPING FOR " . $self->quote_object_name($self->{dblink}{$db}{username})
 							. " SERVER " . $self->quote_object_name($db)
@@ -4587,7 +4599,7 @@ LANGUAGE plpgsql ;
 					$self->{child_count}--;
 					delete $RUNNING_PIDS{$kid};
 				}
-				usleep(500000);
+				usleep(50000);
 			}
 			if (!$self->{quiet} && !$self->{debug}) {
 				print STDERR "\n";
@@ -4816,7 +4828,7 @@ LANGUAGE plpgsql ;
 					$parallel_fct_count--;
 					delete $RUNNING_PIDS{$kid};
 				}
-				usleep(500000);
+				usleep(50000);
 			}
 			if ($self->{estimate_cost}) {
 				my $tfh = $self->read_export_file($dirprefix . 'temp_cost_file.dat');
@@ -4991,7 +5003,7 @@ LANGUAGE plpgsql ;
 					$parallel_fct_count--;
 					delete $RUNNING_PIDS{$kid};
 				}
-				usleep(500000);
+				usleep(50000);
 			}
 			if ($self->{estimate_cost}) {
 				my $tfh = $self->read_export_file($dirprefix . 'temp_cost_file.dat');
@@ -5436,6 +5448,8 @@ LANGUAGE plpgsql ;
 		my $dirprefix = '';
 		$dirprefix = "$self->{output_dir}/" if ($self->{output_dir});
 
+                my $t0 = Benchmark->new;
+
 		# Connect the Oracle database to gather information
 		if ($self->{oracle_dsn} =~ /dbi:mysql/i) {
 			$self->{dbh} = $self->_mysql_connection();
@@ -5480,7 +5494,7 @@ LANGUAGE plpgsql ;
 			if ($self->{defer_fkey}) {
 				$first_header .= "SET CONSTRAINTS ALL DEFERRED;\n\n";
 			}
-		} else {
+		} elsif (!$self->{oracle_speed}) {
 			# Set search path
 			if ($search_path) {
 				$self->{dbhdest}->do($search_path) or $self->logit("FATAL: " . $self->{dbhdest}->errstr . "\n", 0, 1);
@@ -5535,7 +5549,7 @@ LANGUAGE plpgsql ;
 			}
 
 			# Disable triggers of current table if requested
-			if ($self->{disable_triggers}) {
+			if ($self->{disable_triggers} && !$self->{oracle_speed}) {
 				my $trig_type = 'USER';
 				$trig_type = 'ALL' if (uc($self->{disable_triggers}) eq 'ALL');
 				if ($self->{pg_dsn}) {
@@ -5647,7 +5661,7 @@ LANGUAGE plpgsql ;
 		}
 
 		# Commit transaction
-		if ($self->{pg_dsn}) {
+		if ($self->{pg_dsn} && !$self->{oracle_speed}) {
 			my $s = $self->{dbhdest}->do("COMMIT;") or $self->logit("FATAL: " . $self->{dbhdest}->errstr . "\n", 0, 1);
 		}
 
@@ -5732,7 +5746,7 @@ LANGUAGE plpgsql ;
 						$parallel_tables_count--;
 						delete $RUNNING_PIDS{$kid};
 					}
-					usleep(500000);
+					usleep(50000);
 				}
 			} else {
 				$total_record = $self->_export_table_data($table, $dirprefix, $sql_header);
@@ -5769,7 +5783,7 @@ LANGUAGE plpgsql ;
 				if ($kid > 0) {
 					delete $RUNNING_PIDS{$kid};
 				}
-				usleep(500000);
+				usleep(50000);
 			}
 			# Terminate the process logger
 			foreach my $k (keys %RUNNING_PIDS) {
@@ -5787,7 +5801,7 @@ LANGUAGE plpgsql ;
 		}
 		
 		# Start a new transaction
-		if ($self->{pg_dsn}) {
+		if ($self->{pg_dsn} && !$self->{oracle_speed}) {
 			my $s = $self->{dbhdest}->do("BEGIN;") or $self->logit("FATAL: " . $self->{dbhdest}->errstr . "\n", 0, 1);
 
 		}
@@ -5887,7 +5901,7 @@ LANGUAGE plpgsql ;
 			
 
 			# disable triggers of current table if requested
-			if ($self->{disable_triggers}) {
+			if ($self->{disable_triggers} && !$self->{oracle_speed}) {
 				my $trig_type = 'USER';
 				$trig_type = 'ALL' if (uc($self->{disable_triggers}) eq 'ALL');
 				my $str = "ALTER TABLE $tmptb ENABLE TRIGGER $trig_type;";
@@ -5899,7 +5913,7 @@ LANGUAGE plpgsql ;
 			}
 
 			# Recreate all foreign keys of the concerned tables
-			if ($self->{drop_fkey}) {
+			if ($self->{drop_fkey} && !$self->{oracle_speed}) {
 				my @create_all = ();
 				$self->logit("Restoring foreign keys of table $table...\n", 1);
 				push(@create_all, $self->_create_foreign_keys($table, $novalid));
@@ -5915,7 +5929,7 @@ LANGUAGE plpgsql ;
 			}
 
 			# Recreate all indexes
-			if ($self->{drop_indexes}) {
+			if ($self->{drop_indexes} && !$self->{oracle_speed}) {
 				my @create_all = ();
 				$self->logit("Restoring indexes of table $table...\n", 1);
 				push(@create_all, $self->_create_indexes($table, 1, %{$self->{tables}{$table}{indexes}}));
@@ -5934,7 +5948,7 @@ LANGUAGE plpgsql ;
 		}
 
 		# Insert restart sequences orders
-		if (($#ordered_tables >= 0) && !$self->{disable_sequence}) {
+		if (($#ordered_tables >= 0) && !$self->{disable_sequence} && !$self->{oracle_speed}) {
 			$self->logit("Restarting sequences\n", 1);
 			my @restart_sequence = $self->_extract_sequence_info();
 			foreach my $str (@restart_sequence) {
@@ -5956,7 +5970,7 @@ LANGUAGE plpgsql ;
 		}
 
 		# Commit transaction
-		if ($self->{pg_dsn}) {
+		if ($self->{pg_dsn} && !$self->{oracle_speed}) {
 			my $s = $self->{dbhdest}->do("COMMIT;") or $self->logit("FATAL: " . $self->{dbhdest}->errstr . "\n", 0, 1);
 		} else {
 			$footer .= "COMMIT;\n\n";
@@ -5972,6 +5986,32 @@ LANGUAGE plpgsql ;
 		$self->{dbh}->disconnect() if ($self->{dbh});
 		$self->{dbhdest}->disconnect() if ($self->{dbhdest});
 
+		my $npart = 0;
+		my $nsubpart = 0;
+		foreach my $t (sort keys %{ $self->{partitions} }) {
+			$npart += scalar keys %{$self->{partitions}{$t}};
+		}
+		foreach my $t (sort keys %{ $self->{subpartitions_list} }) {
+			foreach my $p (sort keys %{ $self->{subpartitions_list}{$t} }) {
+				$nsubpart += scalar keys %{ $self->{subpartitions_list}{$t}{$p}};
+			}
+		}
+
+
+                my $t1 = Benchmark->new;
+                my $td = timediff($t1, $t0);
+		my $timestr = timestr($td);
+		my $title = 'Total time to export data';
+		if ($self->{ora2pg_speed}) {
+			$title = 'Total time to process data from Oracle';
+		} elsif ($self->{oracle_speed}) {
+			$title = 'Total time to extract data from Oracle';
+		}
+                $self->logit("$title from " . (scalar keys %{$self->{tables}}) . " tables ($npart partitions, $nsubpart sub-partitions) and $self->{global_rows} total rows: $timestr\n", 1);
+		if ($timestr =~ /^(\d+) wallclock secs/) {
+			my $mean = sprintf("%.2f", $self->{global_rows}/($1 || 1));
+			$self->logit("Speed average: $mean rows/sec\n", 1);
+		}
 		return;
 	}
 
@@ -6036,9 +6076,6 @@ BEGIN
 					$create_table_tmp .= "FOR VALUES";
 				}
 
-				$tb_name = $table . "_" if ($self->{prefix_partition});
-
-				my $check_cond = '';
 				my @condition = ();
 				my @ind_col = ();
 				for (my $i = 0; $i <= $#{$self->{partitions}{$table}{$pos}{info}}; $i++) {
@@ -6120,16 +6157,21 @@ BEGIN
 						}
 					}
 					if (!exists $self->{subpartitions}{$table}{$part} || (!$self->{pg_supports_partition} && $has_hash_subpartition)) {
-						$create_table_index_tmp .= "CREATE INDEX "
-									. $self->quote_object_name("${tb_name}_$colname")
-									. " ON $tb_name ($cindx);\n";
-						my $tb_name2 = $self->quote_object_name($tb_name);
 						# Reproduce indexes definition from the main table
 						my ($idx, $fts_idx) = $self->_create_indexes($table, 0, %{$self->{tables}{$table}{indexes}});
+						my $tb_name2 = $self->quote_object_name($tb_name);
+						$create_table_index_tmp .= "CREATE INDEX "
+								. $self->quote_object_name("${tb_name}_$colname")
+								. " ON " . $self->quote_object_name($tb_name) . " ($cindx);\n";
 						if ($idx || $fts_idx) {
-							$idx =~ s/$table/$tb_name2/igs;
-							$fts_idx =~ s/$table/$tb_name2/igs;
-							$create_table_index_tmp .= "-- Reproduce indexes that was defined on the parent table\n";
+							$idx =~ s/ $table/ $tb_name2/igs;
+							$fts_idx =~ s/ $table/ $tb_name2/igs;
+							# remove indexes already created
+							$idx =~ s/CREATE [^;]+ \($cindx\);//;
+							$fts_idx =~ s/CREATE [^;]+ \($cindx\);//;
+							if ($idx || $fts_idx) {
+								$create_table_index_tmp .= "-- Reproduce partition indexes that was defined on the parent table\n";
+							}
 							$create_table_index_tmp .= "$idx\n" if ($idx);
 							$create_table_index_tmp .= "$fts_idx\n" if ($fts_idx);
 						}
@@ -6137,9 +6179,18 @@ BEGIN
 						# Set the unique (and primary) key definition 
 						$idx = $self->_create_unique_keys($table, $self->{tables}{$table}{unique_key});
 						if ($idx) {
-							$create_table_index_tmp .= "-- Reproduce unique indexes / pk that was defined on the parent table\n";
-							$idx =~ s/$table/$tb_name2/igs;
-							$create_table_index_tmp .= "$idx\n" if ($idx);
+							$idx =~ s/ $table/ $tb_name2/igs;
+							# remove indexes already created
+							$idx =~ s/CREATE [^;]+ \($cindx\);//;
+							if ($idx) {
+								$create_table_index_tmp .= "-- Reproduce partition unique indexes / pk that was defined on the parent table\n";
+								$create_table_index_tmp .= "$idx\n";
+								# Remove duplicate index with this one
+								if ($idx =~ /ALTER TABLE $tb_name2 ADD PRIMARY KEY (.*);/s) { 
+									my $collist = quotemeta($1);
+									$create_table_index_tmp =~ s/CREATE INDEX [^;]+ ON $tb_name2 $collist;//s;
+								}
+							}
 						}
 					}
 					my $deftb = '';
@@ -6148,7 +6199,7 @@ BEGIN
 						$cindx = $self->{partitions}{$table}{$pos}{info}[$i]->{column} || '';
 						$cindx = lc($cindx) if (!$self->{preserve_case});
 						$cindx = Ora2Pg::PLSQL::convert_plsql_code($self, $cindx, %{$self->{data_type}});
-						$create_table_index_tmp .= "CREATE INDEX $deftb$self->{partitions_default}{$table}_$colname ON $deftb$self->{partitions_default}{$table} ($cindx);\n";
+						$create_table_index_tmp .= "CREATE INDEX " . $self->quote_object_name("$deftb$self->{partitions_default}{$table}_$colname") . " ON " . $self->quote_object_name("$deftb$self->{partitions_default}{$table}") . " ($cindx);\n";
 					}
 					push(@ind_col, $self->{partitions}{$table}{$pos}{info}[$i]->{column}) if (!grep(/^$self->{partitions}{$table}{$pos}{info}[$i]->{column}$/, @ind_col));
 					if ($self->{partitions}{$table}{$pos}{info}[$i]->{type} eq 'LIST') {
@@ -6179,6 +6230,7 @@ BEGIN
 						$check_cond .= ';' if ($self->{pg_supports_partition});
 						$create_table_tmp .= $check_cond . "\n";
 						$create_table_tmp .= ") ) INHERITS ($table);\n" if (!$self->{pg_supports_partition});
+						$check_cond = '';
 					}
 					$owner = $self->{force_owner} if ($self->{force_owner} ne "1");
 					if ($owner) {
@@ -6189,6 +6241,7 @@ BEGIN
 					$create_table_tmp .= $check_cond;
 					$create_table_tmp .= "\nPARTITION BY " . $self->{subpartitions_list}{"\L$table\E"}{"\L$part\E"}{type} . " (" . lc(join(',', @{$self->{subpartitions_list}{"\L$table\E"}{"\L$part\E"}{columns}})) . ")" if (exists $self->{subpartitions_list}{"\L$table\E"}{"\L$part\E"}{type});
 					$create_table_tmp .= ";\n";
+					$check_cond = '';
 				}
 				# Add subpartition if any defined on Oracle
 				my $sub_funct_cond = '';
@@ -6197,7 +6250,6 @@ BEGIN
 					my $sub_cond = 'IF';
 					my $sub_funct_cond_tmp = '';
 					my $create_subtable_tmp = '';
-					my $sub_check_cond_tmp = '';
 					foreach my $p (sort {$a <=> $b} keys %{$self->{subpartitions}{$table}{$part}}) {
 						my $subpart = $self->{subpartitions}{$table}{$part}{$p}{name};
 						if (!$self->{quiet} && !$self->{debug}) {
@@ -6205,13 +6257,11 @@ BEGIN
 						}
 						my $sub_tb_name = $subpart;
 						$sub_tb_name =~ s/^[^\.]+\.//; # remove schema part if any
-						$tb_name .= '_' if ($tb_name && $tb_name !~ /_$/);
-						$sub_tb_name = $tb_name . $sub_tb_name if ($sub_tb_name !~ /^$tb_name/i);
 						$create_subtable_tmp .= "CREATE TABLE " . $self->quote_object_name($sub_tb_name);
 						if (!$self->{pg_supports_partition}) {
 							$create_subtable_tmp .= " ( CHECK (\n";
 						} else {
-							$create_subtable_tmp .= " PARTITION OF \L$part\E\n";
+							$create_subtable_tmp .= " PARTITION OF " . $self->quote_object_name($tb_name) . "\n";
 							$create_subtable_tmp .= "FOR VALUES";
 						}
 						my $sub_check_cond_tmp = '';
@@ -6282,15 +6332,20 @@ BEGIN
 							$cindx = join(',', @ind_col);
 							$cindx = lc($cindx) if (!$self->{preserve_case});
 							$cindx = Ora2Pg::PLSQL::convert_plsql_code($self, $cindx, %{$self->{data_type}});
-							$create_table_index_tmp .= "CREATE INDEX " . $self->quote_object_name("${tb_name}${sub_tb_name}_$colname")
-												 . " ON ${tb_name}$sub_tb_name ($cindx);\n";
-							my $tb_name2 = $self->quote_object_name("${tb_name}$sub_tb_name");
+							$create_table_index_tmp .= "CREATE INDEX " . $self->quote_object_name("${tb_name}_${sub_tb_name}_$colname")
+												 . " ON " . $self->quote_object_name("${tb_name}_$sub_tb_name") . " ($cindx);\n";
+							my $tb_name2 = $self->quote_object_name("${tb_name}_$sub_tb_name");
 							# Reproduce indexes definition from the main table
 							my ($idx, $fts_idx) = $self->_create_indexes($table, 0, %{$self->{tables}{$table}{indexes}});
 							if ($idx || $fts_idx) {
-								$idx =~ s/$table/$tb_name2/igs;
-								$fts_idx =~ s/$table/$tb_name2/igs;
-								$create_table_index_tmp .= "-- Reproduce indexes that was defined on the parent table\n";
+								$idx =~ s/ $table/ $tb_name2/igs;
+								$fts_idx =~ s/ $table/ $tb_name2/igs;
+								# remove indexes already created
+								$idx =~ s/CREATE [^;]+ \($cindx\);//;
+								$fts_idx =~ s/CREATE [^;]+ \($cindx\);//;
+								if ($idx || $fts_idx) {
+									$create_table_index_tmp .= "-- Reproduce subpartition indexes that was defined on the parent table\n";
+								}
 								$create_table_index_tmp .= "$idx\n" if ($idx);
 								$create_table_index_tmp .= "$fts_idx\n" if ($fts_idx);
 							}
@@ -6298,9 +6353,18 @@ BEGIN
 							# Set the unique (and primary) key definition 
 							$idx = $self->_create_unique_keys($table, $self->{tables}{$table}{unique_key});
 							if ($idx) {
-								$create_table_index_tmp .= "-- Reproduce unique indexes / pk that was defined on the parent table\n";
-								$idx =~ s/$table/$tb_name2/igs;
-								$create_table_index_tmp .= "$idx\n" if ($idx);
+								$create_table_index_tmp .= "-- Reproduce subpartition unique indexes / pk that was defined on the parent table\n";
+								$idx =~ s/ $table/$tb_name2/igs;
+								# remove indexes already created
+								$idx =~ s/CREATE [^;]+ \($cindx\);//;
+								if ($idx) {
+									$create_table_index_tmp .= "$idx\n";
+									# Remove duplicate index with this one
+									if ($idx =~ /ALTER TABLE $tb_name2 ADD PRIMARY KEY (.*);/s) { 
+										my $collist = quotemeta($1);
+										$create_table_index_tmp =~ s/CREATE INDEX [^;]+ ON $tb_name2 $collist;//s;
+									}
+								}
 							}
 							if ($self->{subpartitions}{$table}{$part}{$p}{info}[$i]->{type} eq 'LIST') {
 								if (!$fct) {
@@ -6325,15 +6389,16 @@ BEGIN
 							$create_subtable_tmp .= $check_cond;
 							$create_subtable_tmp .= " AND $sub_check_cond_tmp" if ($sub_check_cond_tmp);
 							$create_subtable_tmp .= "\n) ) INHERITS ($table);\n";
+							$check_cond = '';
 						}
 						$owner = $self->{force_owner} if ($self->{force_owner} ne "1");
 						if ($owner) {
-							$create_subtable_tmp .= "ALTER TABLE " . $self->quote_object_name("${tb_name}$sub_tb_name")
+							$create_subtable_tmp .= "ALTER TABLE " . $self->quote_object_name("${tb_name}_$sub_tb_name")
 											. " OWNER TO " . $self->quote_object_name($owner) . ";\n";
 						}
 						if ($#subcondition >= 0) {
 							$sub_funct_cond_tmp .= "\t\t$sub_cond ( " . join(' AND ', @subcondition) . " ) THEN INSERT INTO "
-										. $self->quote_object_name("${tb_name}$sub_tb_name") . " VALUES (NEW.*);\n";
+										. $self->quote_object_name("${tb_name}_$sub_tb_name") . " VALUES (NEW.*);\n";
 							$sub_cond = 'ELSIF';
 						}
 						$sub_old_part = $part;
@@ -6359,7 +6424,7 @@ BEGIN
 						$create_table_tmp .= "CREATE TABLE " . $self->quote_object_name("$deftb$self->{subpartitions_default}{$table}{$part}")
 									. " () INHERITS ($table);\n";
 						$create_table_index_tmp .= "CREATE INDEX " . $self->quote_object_name("$deftb$self->{subpartitions_default}{$table}{$part}_$pos")
-									. " ON $deftb$self->{subpartitions_default}{$table}{$part} ($cindx);\n";
+									. " ON " . $self->quote_object_name("$deftb$self->{subpartitions_default}{$table}{$part}") . " ($cindx);\n";
 					} else {
 						$funct_cond .= qq{		ELSE
 			-- Raise an exception
@@ -7151,7 +7216,7 @@ sub fix_function_call
 			$child_count--;
 			delete $RUNNING_PIDS{$kid};
 		}
-		usleep(500000);
+		usleep(50000);
 	}
 }
 
@@ -7212,6 +7277,8 @@ sub read_input_file
 sub file_exists
 {
 	my ($self, $file) = @_;
+
+	return 0 if ($self->{oracle_speed});
 
 	if ($self->{file_per_table} && !$self->{pg_dsn}) {
 		if (-e "$file") {
@@ -7410,6 +7477,8 @@ sub _column_comments
 
 This function return SQL code to create indexes of a table
 and triggers to create for FTS indexes.
+
+- $indexonly mean no FTS index output
 
 =cut
 sub _create_indexes
@@ -8451,6 +8520,8 @@ VARCHAR2
 			}
 		}
 	}
+
+	$self->logit("DEGUG: Query sent to Oracle: $str\n", 1);
 
 	return $str;
 }
@@ -10881,10 +10952,8 @@ sub _get_audit_queries
 		$row->[0] =~  s/\%ORA2PG_COMMENT\d+\%//gs;
 		$row->[0] =  $self->normalize_query($row->[0]);
 		$tmp_queries{$row->[0]}++;
-		$self->logit(".",1);
 	}
 	$sth->finish;
-	$self->logit("\n", 1);
 
 	my %queries = ();
 	my $i = 1;
@@ -10944,10 +11013,8 @@ AND a.TABLESPACE_NAME = c.TABLESPACE_NAME
 			$row->[0] = "$row->[4].$row->[0]";
 		}
 		push(@{$tbs{$row->[2]}{$row->[1]}{$row->[3]}}, $row->[0]);
-		$self->logit(".",1);
 	}
 	$sth->finish;
-	$self->logit("\n", 1);
 
 	return \%tbs;
 }
@@ -10983,10 +11050,8 @@ WHERE a.TABLESPACE_NAME = c.TABLESPACE_NAME
 	while (my $row = $sth->fetch) {
 		$tbs{$row->[1]}{path} = $row->[0];
 		$tbs{$row->[1]}{owner} = $row->[2];
-		$self->logit(".",1);
 	}
 	$sth->finish;
-	$self->logit("\n", 1);
 
 	return \%tbs;
 }
@@ -11057,10 +11122,8 @@ WHERE
 		}
 		$parts{$row->[0]}{$row->[1]}{name} = $row->[2];
 		push(@{$parts{$row->[0]}{$row->[1]}{info}}, { 'type' => $row->[5], 'value' => $row->[3], 'column' => $row->[7], 'colpos' => $row->[8], 'tablespace' => $row->[4], 'owner' => $row->[9]});
-		$self->logit(".",1);
 	}
 	$sth->finish;
-	$self->logit("\n", 1);
 
 	return \%parts, \%default;
 }
@@ -11132,10 +11195,8 @@ WHERE
 
 		$subparts{$row->[0]}{$row->[10]}{$row->[1]}{name} = $row->[2];
 		push(@{$subparts{$row->[0]}{$row->[10]}{$row->[1]}{info}}, { 'type' => $row->[5], 'value' => $row->[3], 'column' => $row->[7], 'colpos' => $row->[8], 'tablespace' => $row->[4], 'owner' => $row->[9]});
-		$self->logit(".",1);
 	}
 	$sth->finish;
-	$self->logit("\n", 1);
 
 	return \%subparts, \%default;
 }
@@ -11833,6 +11894,8 @@ File is open and locked before writind data, it is closed at end.
 sub data_dump
 {
 	my ($self, $data, $tname, $pname) = @_;
+
+	return if ($self->{oracle_speed});
 
 	my $dirprefix = '';
 	$dirprefix = "$self->{output_dir}/" if ($self->{output_dir});
@@ -13156,7 +13219,7 @@ sub ask_for_data
 				$self->{ora_conn_count}--;
 				delete $RUNNING_PIDS{$kid};
 			}
-			usleep(500000);
+			usleep(50000);
 		}
 		if (defined $pipe) {
 			my $t_name = $part_name || $table;
@@ -13387,6 +13450,9 @@ sub _extract_data
 				$self->{current_total_row} += @$rows;
 				$self->logit("DEBUG: number of rows $total_record extracted from table $table\n", 1);
 
+				# Do we just want to test Oracle output speed
+				next if ($self->{oracle_speed} && !$self->{ora2pg_speed});
+
 				if ( ($self->{jobs} > 1) || ($self->{oracle_copies} > 1) ) {
 					while ($self->{child_count} >= $self->{jobs}) {
 						my $kid = waitpid(-1, WNOHANG);
@@ -13476,6 +13542,9 @@ sub _extract_data
 				$total_record++;
 				$self->{current_total_row}++;
 
+				# Do we just want to test Oracle output speed
+				next if ($self->{oracle_speed} && !$self->{ora2pg_speed});
+
 				if ($#rows == $data_limit) {
 					if ( ($self->{jobs} > 1) || ($self->{oracle_copies} > 1) ) {
 						while ($self->{child_count} >= $self->{jobs}) {
@@ -13496,6 +13565,10 @@ sub _extract_data
 					@rows = ();
 				}
 			}
+
+			# Do we just want to test Oracle output speed
+			next if ($self->{oracle_speed} && !$self->{ora2pg_speed});
+
 			# Flush last extracted data
 			if ( ($self->{jobs} > 1) || ($self->{oracle_copies} > 1) ) {
 				while ($self->{child_count} >= $self->{jobs}) {
@@ -13528,6 +13601,8 @@ sub _extract_data
 				$num_row  = 0;
 				$total_record += @rows;
 				$self->{current_total_row} += @rows;
+				# Do we just want to test Oracle output speed
+				next if ($self->{oracle_speed} && !$self->{ora2pg_speed});
 				if ( ($self->{parallel_tables} > 1) || (($self->{oracle_copies} > 1) && $self->{defined_pk}{"\L$table\E"}) ) {
 					my $max_jobs = $self->{jobs};
 					while ($self->{child_count} >= $max_jobs) {
@@ -13549,7 +13624,7 @@ sub _extract_data
 			}
 		}
 
-		if (@rows) {
+		if (@rows && (!$self->{oracle_speed} || $self->{ora2pg_speed})) {
 			$total_record += @rows;
 			$self->{current_total_row} += @rows;
 			if ( ($self->{parallel_tables} > 1) || (($self->{oracle_copies} > 1) && $self->{defined_pk}{"\L$table\E"}) ) {
@@ -13569,7 +13644,6 @@ sub _extract_data
 			} else {
 				$self->_dump_to_pg($proc, \@rows, $table, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, %user_type);
 			}
-
 		}
 	}
 
@@ -13590,7 +13664,7 @@ sub _extract_data
 			$self->{child_count}--;
 			delete $RUNNING_PIDS{$kid};
 		}
-		usleep(500000);
+		usleep(50000);
 	}
 
 	if (defined $pipe) {
@@ -13672,7 +13746,7 @@ sub _dump_to_pg
 
 	# Connect to PostgreSQL if direct import is enabled
 	my $dbhdest = undef;
-	if ($self->{pg_dsn}) {
+	if ($self->{pg_dsn} && !$self->{oracle_speed}) {
 		$dbhdest = $self->_send_to_pgdb();
 		$self->logit("Dumping data from table $rname into PostgreSQL table $dname...\n", 1);
 		$self->logit("Setting client_encoding to $self->{client_encoding}...\n", 1);
@@ -13686,7 +13760,7 @@ sub _dump_to_pg
 	# Build header of the file
 	my $h_towrite = '';
 	foreach my $cmd (@$cmd_head) {
-		if ($self->{pg_dsn}) {
+		if ($self->{pg_dsn} && !$self->{oracle_speed}) {
 			my $s = $dbhdest->do("$cmd") or $self->logit("FATAL: " . $dbhdest->errstr . "\n", 0, 1);
 		} else {
 			$h_towrite .= "$cmd\n";
@@ -13696,7 +13770,7 @@ sub _dump_to_pg
 	# Build footer of the file
 	my $e_towrite = '';
 	foreach my $cmd (@$cmd_foot) {
-		if ($self->{pg_dsn}) {
+		if ($self->{pg_dsn} && !$self->{oracle_speed}) {
 			my $s = $dbhdest->do("$cmd") or $self->logit("FATAL: " . $dbhdest->errstr . "\n", 0, 1);
 		} else {
 			$e_towrite .= "$cmd\n";
@@ -13726,28 +13800,34 @@ sub _dump_to_pg
 	if ($self->{type} eq 'COPY') {
 		if ($self->{pg_dsn}) {
 			$sql_out =~ s/;$//;
-			$self->logit("DEBUG: Sending COPY bulk output directly to PostgreSQL backend\n", 1);
-			my $s = $dbhdest->do($sql_out) or $self->logit("FATAL: " . $dbhdest->errstr . "\n", 0, 1);
-			$sql_out = '';
-			my $skip_end = 0;
-			foreach my $row (@$rows) {
-				unless($dbhdest->pg_putcopydata(join("\t", @$row) . "\n")) {
+			if (!$self->{oracle_speed}) {
+				$self->logit("DEBUG: Sending COPY bulk output directly to PostgreSQL backend\n", 1);
+				$dbhdest->do($sql_out) or $self->logit("FATAL: " . $dbhdest->errstr . "\n", 0, 1);
+				$sql_out = '';
+				my $skip_end = 0;
+				foreach my $row (@$rows) {
+					unless($dbhdest->pg_putcopydata(join("\t", @$row) . "\n")) {
+						if ($self->{log_on_error}) {
+							$self->logit("ERROR (log error enabled): " . $dbhdest->errstr . "\n", 0, 0);
+							$self->log_error_copy($table, $s_out, $rows);
+							$skip_end = 1;
+							last;
+						} else {
+							$self->logit("FATAL: " . $dbhdest->errstr . "\n", 0, 1);
+						}
+					}
+				}
+				unless ($dbhdest->pg_putcopyend()) {
 					if ($self->{log_on_error}) {
 						$self->logit("ERROR (log error enabled): " . $dbhdest->errstr . "\n", 0, 0);
-						$self->log_error_copy($table, $s_out, $rows);
-						$skip_end = 1;
-						last;
+						$self->log_error_copy($table, $s_out, $rows) if (!$skip_end);
 					} else {
 						$self->logit("FATAL: " . $dbhdest->errstr . "\n", 0, 1);
 					}
 				}
-			}
-			unless ($dbhdest->pg_putcopyend()) {
-				if ($self->{log_on_error}) {
-					$self->logit("ERROR (log error enabled): " . $dbhdest->errstr . "\n", 0, 0);
-					$self->log_error_copy($table, $s_out, $rows) if (!$skip_end);
-				} else {
-					$self->logit("FATAL: " . $dbhdest->errstr . "\n", 0, 1);
+			} else {
+				foreach my $row (@$rows) {
+					# do nothing, just add loop time nothing must be sent to PG
 				}
 			}
 		} else {
@@ -13766,7 +13846,7 @@ sub _dump_to_pg
 	# Insert data if we are in online processing mode
 	if ($self->{pg_dsn}) {
 		if ($self->{type} ne 'COPY') {
-			if (!$sprep) {
+			if (!$sprep && !$self->{oracle_speed}) {
 				$self->logit("DEBUG: Sending INSERT output directly to PostgreSQL backend\n", 1);
 				unless($dbhdest->do("BEGIN;\n" . $sql_out . "COMMIT;\n")) {
 					if ($self->{log_on_error}) {
@@ -13777,12 +13857,17 @@ sub _dump_to_pg
 					}
 				}
 			} else {
-				my $ps = $dbhdest->prepare($sprep) or $self->logit("FATAL: " . $dbhdest->errstr . "\n", 0, 1);
+				my $ps = undef;
+				if (!$self->{oracle_speed}) {
+					$ps = $dbhdest->prepare($sprep) or $self->logit("FATAL: " . $dbhdest->errstr . "\n", 0, 1);
+				}
 				my @date_cols = ();
 				my @bool_cols = ();
 				for (my $i = 0; $i <= $#{$tt}; $i++) {
 					if ($tt->[$i] eq 'bytea') {
-						$ps->bind_param($i+1, undef, { pg_type => DBD::Pg::PG_BYTEA });
+						if (!$self->{oracle_speed}) {
+							$ps->bind_param($i+1, undef, { pg_type => DBD::Pg::PG_BYTEA });
+						}
 					} elsif ($tt->[$i] eq 'boolean') {
 						push(@bool_cols, $i);
 					} elsif ($tt->[$i] =~ /(date|time)/i) {
@@ -13809,25 +13894,32 @@ sub _dump_to_pg
 						($row->[$j] eq "'f'") ? $row->[$j] = 0 : $row->[$j] = 1;
 					}
 					# Apply bind parmeters
-					unless ($ps->execute(@$row) ) {
-						if ($self->{log_on_error}) {
-							$self->logit("ERROR (log error enabled): " . $ps->errstr . "\n", 0, 0);
-							$s_out =~ s/\([,\?]+\)/\(/;
-							$self->format_data_row($row,$tt,'INSERT', $stt, \%user_type, $table, $col_cond);
-							$self->log_error_insert($table, $s_out . join(',', @$row) . ");\n");
-						} else {
-							$self->logit("FATAL: " . $ps->errstr . "\n", 0, 1);
+					if (!$self->{oracle_speed}) {
+						unless ($ps->execute(@$row) ) {
+							if ($self->{log_on_error}) {
+								$self->logit("ERROR (log error enabled): " . $ps->errstr . "\n", 0, 0);
+								$s_out =~ s/\([,\?]+\)/\(/;
+								$self->format_data_row($row,$tt,'INSERT', $stt, \%user_type, $table, $col_cond);
+								$self->log_error_insert($table, $s_out . join(',', @$row) . ");\n");
+							} else {
+								$self->logit("FATAL: " . $ps->errstr . "\n", 0, 1);
+							}
 						}
 					}
 				}
-				$ps->finish();
+				if (!$self->{oracle_speed}) {
+					$ps->finish();
+				}
 			}
 		}
 	} else {
 		if ($part_name && $self->{prefix_partition})  {
 			$part_name = $table . '_' . $part_name;
 		}
-		$self->data_dump($h_towrite . $sql_out . $e_towrite, $table, $part_name);
+		$sql_out = $h_towrite . $sql_out . $e_towrite;
+		if (!$self->{oracle_speed}) {
+			$self->data_dump($sql_out, $table, $part_name);
+		}
 	}
 
 	my $total_row = $self->{tables}{$table}{table_info}{num_rows};
