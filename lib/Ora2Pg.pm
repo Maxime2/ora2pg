@@ -1232,6 +1232,13 @@ sub _init
 	$self->{estimate_cost} = 1 if ($self->{dump_as_sheet});
 	$self->{count_rows} ||= 0;
 
+	# Enforce preservation of primary and unique keys
+	# when USE_TABLESPACE is enabled
+	if ($self->{use_tablespace} && !$self->{keep_pkey_names}) {
+	    print STDERR "WARNING: Enforcing KEEP_PKEY_NAMES to 1 as USE_TABLESPACE is enabled.\n";
+	    $self->{keep_pkey_names} = 1;
+	}
+
 	# DATADIFF defaults
 	$self->{datadiff} ||= 0;
 	$self->{datadiff_del_suffix} ||= '_del';
@@ -5351,6 +5358,7 @@ LANGUAGE plpgsql ;
 		}
 		my $dirprefix = '';
 		foreach my $tb_type (sort keys %{$self->{tablespaces}}) {
+			next if ($tb_type eq 'INDEX PARTITION' || $tb_type eq 'TABLE PARTITION');
 			# TYPE - TABLESPACE_NAME - FILEPATH - OBJECT_NAME
 			foreach my $tb_name (sort keys %{$self->{tablespaces}{$tb_type}}) {
 				foreach my $tb_path (sort keys %{$self->{tablespaces}{$tb_type}{$tb_name}}) {
@@ -6411,7 +6419,7 @@ BEGIN
 				}
 
 				if (!$sub_funct_cond) {
-					$funct_cond .= "\t$cond ( " . join(' AND ', @condition) . " ) THEN INSERT INTO $tb_name VALUES (NEW.*);\n";
+					$funct_cond .= "\t$cond ( " . join(' AND ', @condition) . " ) THEN INSERT INTO " . $self->quote_object_name($tb_name) . " VALUES (NEW.*);\n";
 				} else {
 					$sub_funct_cond = Ora2Pg::PLSQL::convert_plsql_code($self, $sub_funct_cond, %{$self->{data_type}});
 					$funct_cond .= "\t$cond ( " . join(' AND ', @condition) . " ) THEN \n";
